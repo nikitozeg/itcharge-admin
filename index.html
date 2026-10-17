@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; connect-src https://api.itcharge.ru; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+  <title>Аналитика зарядок</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="bolt" aria-hidden="true">⚡</span>
+      <span>Аналитика зарядок</span>
+      <span class="brand-sub">IT Charge</span>
+    </div>
+    <div class="top-actions" id="topActions" hidden>
+      <span class="sync-info" id="syncInfo"></span>
+      <button class="btn" id="syncBtn" type="button">Обновить</button>
+      <button class="btn ghost" id="logoutBtn" type="button">Выйти</button>
+    </div>
+  </header>
+
+  <section class="login" id="login" hidden>
+    <form class="login-card" id="loginForm">
+      <h1>Вход в IT Charge</h1>
+      <p class="muted">Те же email и пароль, что на cp.itcharge.ru. Вход идёт напрямую в API IT Charge, токен и данные хранятся только в этом браузере.</p>
+      <label>Email<input name="email" type="email" autocomplete="username" required /></label>
+      <label>Пароль<input name="password" type="password" autocomplete="current-password" required /></label>
+      <button class="btn primary" type="submit">Войти</button>
+      <p class="error" id="loginError" role="alert"></p>
+    </form>
+  </section>
+
+  <section class="loading" id="loading" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="loadingText">Загружаю историю транзакций…</p>
+  </section>
+
+  <main class="dash" id="dash" hidden>
+    <div class="filters" role="toolbar" aria-label="Фильтры">
+      <div class="seg" id="periodSeg" role="radiogroup" aria-label="Период">
+        <button type="button" data-days="7">7 дней</button>
+        <button type="button" data-days="30">30 дней</button>
+        <button type="button" data-days="90">90 дней</button>
+        <button type="button" data-days="365">12 мес</button>
+        <button type="button" data-days="all">Всё время</button>
+      </div>
+      <div class="range">
+        <input type="date" id="fromDate" aria-label="С даты" />
+        <span class="muted">—</span>
+        <input type="date" id="toDate" aria-label="По дату" />
+      </div>
+      <div class="chips" id="stationChips" aria-label="Станции"></div>
+      <div class="seg" id="granSeg" role="radiogroup" aria-label="Шаг">
+        <button type="button" data-gran="auto">Авто</button>
+        <button type="button" data-gran="day">Дни</button>
+        <button type="button" data-gran="week">Недели</button>
+        <button type="button" data-gran="month">Месяцы</button>
+      </div>
+    </div>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2 id="mainTitle">Энергия по станциям</h2>
+          <p class="muted" id="mainSub"></p>
+        </div>
+        <div class="card-tools">
+          <div class="seg small" id="metricSeg" role="radiogroup" aria-label="Показатель">
+            <button type="button" data-metric="kwh">кВт⋅ч</button>
+            <button type="button" data-metric="rub">Выручка</button>
+            <button type="button" data-metric="count">Сессии</button>
+          </div>
+          <div class="seg small" id="viewSeg" role="radiogroup" aria-label="Вид">
+            <button type="button" data-view="chart">График</button>
+            <button type="button" data-view="table">Таблица</button>
+          </div>
+        </div>
+      </div>
+      <div class="chart-box tall" id="mainChartBox"><canvas id="mainChart"></canvas></div>
+      <div class="table-wrap" id="mainTableBox" hidden></div>
+    </section>
+
+    <div class="grid2">
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <h2>Загрузка станций</h2>
+            <p class="muted">Доля времени, когда к станции подключена машина</p>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="utilChart"></canvas></div>
+      </section>
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <h2>Когда заряжают</h2>
+            <p class="muted">Начало сессий по дням недели и часам (МСК)</p>
+          </div>
+        </div>
+        <div class="heatmap" id="heatmap"></div>
+      </section>
+    </div>
+
+    <div class="grid2">
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <h2>Энергия за сессию</h2>
+            <p class="muted">Сколько сессий набирают N кВт⋅ч</p>
+          </div>
+        </div>
+        <div class="chart-box"><canvas id="histChart"></canvas></div>
+      </section>
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <h2>По станциям</h2>
+            <p class="muted">Итоги за выбранный период</p>
+          </div>
+        </div>
+        <div class="table-wrap" id="stationTable"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Сессии</h2>
+          <p class="muted" id="sessionsSub"></p>
+        </div>
+      </div>
+      <div class="table-wrap" id="sessionsTable"></div>
+      <button class="btn ghost more" id="moreBtn" type="button" hidden>Показать ещё</button>
+    </section>
+  </main>
+
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
