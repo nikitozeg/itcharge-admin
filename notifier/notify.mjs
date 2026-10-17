@@ -115,18 +115,53 @@ async function latestTransactions(token) {
   return data.TransactionsList.rows;
 }
 
-async function sendTelegram(botToken, chatId, text) {
-  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+// Приводит id канала к виду, который понимает Telegram: «@имя» или «-100…».
+// Принимает и ссылки t.me/имя, и номер из ссылки t.me/c/<номер>/… без префикса -100.
+export function normalizeChatId(value) {
+  const v = String(value ?? '').trim().replace(/^["'«]+|["'»]+$/g, '').trim();
+  const link = v.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:c\/(\d+)|([A-Za-z]\w{3,}))/);
+  if (link) return link[1] ? `-100${link[1]}` : `@${link[2]}`;
+  if (/^[A-Za-z]\w{3,}$/.test(v)) return `@${v}`;
+  return v;
+}
+
+// Описание формата без самого значения — логи публичные.
+function describeChatId(value) {
+  const v = String(value ?? '');
+  if (/^@\w+$/.test(v)) return '@имя';
+  if (/^-100\d+$/.test(v)) return 'число -100…';
+  if (/^-\d+$/.test(v)) return 'отрицательное число без -100 (id группы, а не канала?)';
+  if (/^\d+$/.test(v)) return 'положительное число (так выглядит id пользователя, а не канала)';
+  return 'нераспознанный формат';
+}
+
+async function telegram(botToken, method, payload) {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }),
+    body: JSON.stringify(payload),
   });
-  const json = await res.json().catch(() => ({}));
-  if (!json.ok) throw new Error(`Telegram: ${json.description ?? `HTTP ${res.status}`}`);
+  return res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
+}
+
+async function sendTelegram(botToken, chatId, text) {
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } };
+  let json = await telegram(botToken, 'sendMessage', payload);
+  // Номер канала без -100 (из ссылки t.me/c/…) — пробуем ещё раз с префиксом.
+  if (!json.ok && /chat not found/i.test(json.description ?? '') && /^\d+$/.test(chatId)) {
+    json = await telegram(botToken, 'sendMessage', { ...payload, chat_id: `-100${chatId}` });
+  }
+  if (!json.ok) {
+    const me = await telegram(botToken, 'getMe', {});
+    const bot = me.ok ? `@${me.result.username}` : 'токен не принят Telegram';
+    throw new Error(`Telegram: ${json.description ?? 'ошибка'} · бот: ${bot} · формат TELEGRAM_CHAT_ID: ${describeChatId(chatId)}`);
+  }
 }
 
 async function main() {
-  const { ITCHARGE_EMAIL, ITCHARGE_PASSWORD, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = process.env;
+  const { ITCHARGE_EMAIL, ITCHARGE_PASSWORD } = process.env;
+  const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const TELEGRAM_CHAT_ID = normalizeChatId(process.env.TELEGRAM_CHAT_ID);
   const test = process.env.TEST === 'true';
   const statePath = process.argv[2] ?? 'state.json';
 
