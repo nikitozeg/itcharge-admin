@@ -758,27 +758,37 @@ function renderUtil(v) {
   });
 }
 
+const HOUR = 3600e3;
+
+// Энергия сессии раскладывается по часам, которые она заняла, пропорционально времени.
 function renderHeatmap(v) {
-  const counts = Array.from({ length: 7 }, () => new Array(24).fill(0));
+  const kwh = Array.from({ length: 7 }, () => new Array(24).fill(0));
   for (const r of v.charged) {
-    const p = mskParts(r.t);
-    counts[p.dow][p.h]++;
+    const end = Math.min(Math.max(r.te, r.t + 60e3), r.t + 48 * HOUR);
+    const span = end - r.t;
+    for (let a = r.t; a < end; ) {
+      const next = Math.min(end, (Math.floor(a / HOUR) + 1) * HOUR); // МСК сдвинута на целые часы
+      const p = mskParts(a);
+      kwh[p.dow][p.h] += (r.kwh * (next - a)) / span;
+      a = next;
+    }
   }
-  const max = Math.max(1, ...counts.flat());
+  const fmtKwh = (n) => `${n < 10 ? nf1.format(n) : nf0.format(n)} кВт⋅ч`;
+  const max = Math.max(...kwh.flat());
   const levels = 7;
   const cells = [h('div')];
   for (let hr = 0; hr < 24; hr++) cells.push(h('div', { class: 'hlabel' }, hr % 3 === 0 ? hr : ''));
-  counts.forEach((row, d) => {
+  kwh.forEach((row, d) => {
     cells.push(h('div', { class: 'dlabel' }, WEEKDAYS[d]));
     row.forEach((n, hr) => {
-      const level = n ? Math.min(levels - 1, Math.floor((n / max) * levels)) : -1;
+      const level = n > 0 ? Math.min(levels - 1, Math.floor((n / max) * levels)) : -1;
       const label = `${WEEKDAYS[d]}, ${String(hr).padStart(2, '0')}:00–${String(hr + 1).padStart(2, '0')}:00`;
       cells.push(
         h('div', {
           class: 'cell',
           tabindex: '0',
-          'aria-label': `${label}: ${n} сессий`,
-          'data-value': `${nf0.format(n)} ${plural(n, 'сессия', 'сессии', 'сессий')}`,
+          'aria-label': `${label}: ${fmtKwh(n)}`,
+          'data-value': fmtKwh(n),
           'data-label': label,
           style: level >= 0 ? { background: `var(--heat-${level})` } : {},
         }),
@@ -788,9 +798,9 @@ function renderHeatmap(v) {
   const legend = h(
     'div',
     { class: 'heat-legend' },
-    h('span', {}, 'реже'),
+    h('span', {}, 'меньше'),
     h('div', { class: 'ramp' }, Array.from({ length: levels }, (_, i) => h('span', { style: { background: `var(--heat-${i})` } }))),
-    h('span', {}, `чаще (до ${max} за час)`),
+    h('span', {}, `больше (до ${fmtKwh(max)} за час)`),
   );
   $('heatmap').replaceChildren(...cells, legend);
 }
