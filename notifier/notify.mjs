@@ -12,6 +12,9 @@ const FINISHED = new Set(['FINISHED_SUCCESS', 'FINISHED_WITH_ERROR', 'CANCELED']
 const PAGE_SIZE = 50; // столько последних транзакций проверяем за запуск
 const KEEP_IDS = 300;
 const OFFLINE_GRACE_MIN = 5; // короткие переподключения станции тревогу не поднимают
+const DAILY_HOUR_MSK = 22; // суточный итог: с 22:00 вчера до 22:00 сегодня по Москве
+const MSK = 3 * 3600e3; // МСК без перехода на летнее время
+const DAY = 86400e3;
 
 const CONNECTORS = { GBT_DC: 'GB/T DC', GBT_AC: 'GB/T AC', C_TYPE2: 'Type 2', C_TYPE1: 'Type 1', C_CCS2: 'CCS2', C_CHADEMO: 'CHAdeMO' };
 const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс' };
@@ -29,6 +32,13 @@ const fmtDuration = (min) => {
   return `${Math.floor(m / 1440)} д ${Math.floor((m % 1440) / 60)} ч`;
 };
 const fmtWhen = (date) => `${dateFmt.format(date)}, ${timeFmt.format(date)}`;
+const plural = (n, one, few, many) => {
+  const n10 = n % 10;
+  const n100 = n % 100;
+  if (n10 === 1 && n100 !== 11) return one;
+  if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+  return many;
+};
 
 export const TX_FIELDS = `
   seqNo id transactionStep startedTimestamp stoppedTimestamp totalKW avgPower maxPower
@@ -123,6 +133,43 @@ export function stationEvents(stations, state, now = Date.now()) {
   return events;
 }
 
+// Конец последних отчётных суток — ближайшие прошедшие 22:00 МСК.
+export function lastDailyEnd(now) {
+  const d = new Date(now + MSK);
+  const end = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), DAILY_HOUR_MSK) - MSK;
+  return end > now ? end - DAY : end;
+}
+export const dailyKey = (end) => new Date(end + MSK).toISOString().slice(0, 10);
+
+// Итог за сутки [start, end): зарядка относится к суткам, в которые закончилась.
+export function formatDaily(rows, start, end) {
+  const byStation = new Map();
+  for (const r of rows) {
+    const stop = Date.parse(r.stoppedTimestamp ?? '');
+    if (!FINISHED.has(r.transactionStep) || !(stop >= start && stop < end)) continue;
+    const name = r.chargingStation?.name ?? 'Станция';
+    const acc = byStation.get(name) ?? { rub: 0, kwh: 0, count: 0 };
+    acc.rub += r.invoice?.amount ?? r.payment?.amount ?? 0;
+    acc.kwh += r.totalKW ?? 0;
+    if (r.totalKW > 0) acc.count++;
+    byStation.set(name, acc);
+  }
+  const total = [...byStation.values()].reduce((a, s) => ({ rub: a.rub + s.rub, kwh: a.kwh + s.kwh, count: a.count + s.count }), { rub: 0, kwh: 0, count: 0 });
+  const period = `${dateFmt.format(start)} ${timeFmt.format(start)} – ${dateFmt.format(end)} ${timeFmt.format(end)}`;
+  const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+  const lines = [`📊 <b>Итог за сутки</b> · ${period}`];
+  if (!total.count) {
+    lines.push(`💰 <b>${nf2.format(total.rub)} ₽</b> · зарядок не было`);
+    return lines.join('\n');
+  }
+  lines.push(`💰 <b>${nf2.format(total.rub)} ₽</b> · ${total.count} ${plural(total.count, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(total.kwh)} кВт⋅ч`);
+  const stations = [...byStation.entries()].filter(([, s]) => s.count).sort((a, b) => b[1].rub - a[1].rub);
+  if (stations.length > 1) {
+    for (const [name, s] of stations) lines.push(`• ${esc(name)} — ${nf2.format(s.rub)} ₽ · ${s.count} · ${nf0.format(s.kwh)} кВт⋅ч`);
+  }
+  return lines.join('\n');
+}
+
 export function formatStatusTest(stations) {
   const lines = ['🧪 <i>Тестовое сообщение — связь станций сейчас</i>'];
   for (const s of stations.filter((x) => !x.archived)) lines.push(`${s.connected ? '🟢' : '🔴'} ${esc(s.name)} — ${s.connected ? 'на связи' : 'нет связи'}`);
@@ -150,15 +197,28 @@ async function login(email, password) {
   return data.UserLogin.token;
 }
 
-async function latestTransactions(token) {
+async function transactionsPage(token, number, size) {
   const data = await gql(
     `query Tx($page: Page!, $orderBy: [TransactionsListRequestOrderInputType!]) {
       TransactionsList(page: $page, orderBy: $orderBy) { rows { ${TX_FIELDS} } }
     }`,
-    { page: { size: PAGE_SIZE, number: 1 }, orderBy: [{ seqNo: 'desc' }] },
+    { page: { size, number }, orderBy: [{ seqNo: 'desc' }] },
     token,
   );
   return data.TransactionsList.rows;
+}
+
+const latestTransactions = (token) => transactionsPage(token, 1, PAGE_SIZE);
+
+// Все транзакции, начатые после since (страницы идут от новых к старым).
+async function transactionsSince(token, since) {
+  const all = [];
+  for (let page = 1; page <= 20; page++) {
+    const rows = await transactionsPage(token, page, 100);
+    all.push(...rows);
+    if (rows.length < 100 || rows.some((r) => Date.parse(r.startedTimestamp) < since)) break;
+  }
+  return all;
 }
 
 async function stationStatuses(token) {
@@ -254,6 +314,16 @@ async function main() {
   const stationMsgs = stationEvents(stations, state);
   const charges = firstRun ? [] : pickNew(rows, state);
   const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t), apply: () => state.notified.push(t.id) }))];
+
+  // Суточный итог — один раз за сутки, даже если GitHub запустил проверку с опозданием.
+  // Впервые — без отправки: начинаем со следующих 22:00.
+  const end = lastDailyEnd(Date.now());
+  const key = dailyKey(end);
+  if (!state.lastDaily) state.lastDaily = key;
+  else if (state.lastDaily < key && Date.now() - end >= 2 * 60e3) {
+    const txs = await transactionsSince(token, end - 2 * DAY);
+    queue.push({ text: formatDaily(txs, end - DAY, end), apply: () => (state.lastDaily = key) });
+  }
   let sent = 0;
   try {
     for (const m of queue) {
@@ -264,7 +334,8 @@ async function main() {
   } finally {
     state.notified = state.notified.slice(-KEEP_IDS);
     await writeFile(statePath, JSON.stringify(state));
-    console.log(`Новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, опубликовано: ${sent}`);
+    const daily = queue.length - stationMsgs.length - charges.length;
+    console.log(`Новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
   }
 }
 
