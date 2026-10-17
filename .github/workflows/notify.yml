@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write # сохранить состояние в ветку notifier-state
-  actions: write # не дать GitHub отключить расписание после 60 дней без коммитов
 
 concurrency:
   group: notify
@@ -62,10 +61,3 @@ jobs:
           git add state.json
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m 'Состояние уведомлений'
           git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:notifier-state
-
-      - name: Продлить расписание
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow enable notify.yml --repo "$GITHUB_REPOSITORY"
