@@ -119,7 +119,10 @@ async function latestTransactions(token) {
 // Принимает и ссылки t.me/имя, и номер из ссылки t.me/c/<номер>/… без префикса -100.
 export function normalizeChatId(value) {
   const v = String(value ?? '').trim().replace(/^["'«]+|["'»]+$/g, '').trim();
-  const link = v.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:c\/(\d+)|([A-Za-z]\w{3,}))/);
+  // Адрес канала в web.telegram.org: …/k/#-1001234567890 или …/a/#@имя
+  const web = v.match(/web\.telegram\.org\/\w\/#(-?\d+|@\w+)/);
+  if (web) return web[1];
+  const link = v.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:c\/(\d+)|(?!joinchat\/)([A-Za-z]\w{3,}))/);
   if (link) return link[1] ? `-100${link[1]}` : `@${link[2]}`;
   if (/^[A-Za-z]\w{3,}$/.test(v)) return `@${v}`;
   return v;
@@ -132,7 +135,10 @@ function describeChatId(value) {
   if (/^-100\d+$/.test(v)) return 'число -100…';
   if (/^-\d+$/.test(v)) return 'отрицательное число без -100 (id группы, а не канала?)';
   if (/^\d+$/.test(v)) return 'положительное число (так выглядит id пользователя, а не канала)';
-  return 'нераспознанный формат';
+  if (/t\.me\/(\+|joinchat\/)/.test(v)) return 'ссылка-приглашение t.me/+… — по ней id не определить';
+  if (/^https?:\/\//.test(v)) return 'ссылка, но не на канал';
+  if (/\s|[А-Яа-яЁё]/.test(v)) return 'текст с пробелами или кириллицей — похоже на название канала';
+  return `нераспознанный формат, ${v.length} символов`;
 }
 
 async function telegram(botToken, method, payload) {
