@@ -1,0 +1,70 @@
+name: Уведомления о зарядках
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # GitHub может запускать с задержкой до 10–15 минут
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Отправить в канал последнюю зарядку для проверки
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # сохранить состояние в ветку notifier-state
+  actions: write # не дать GitHub отключить расписание после 60 дней без коммитов
+
+concurrency:
+  group: notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Загрузить состояние
+        run: |
+          if git fetch -q --depth=1 origin notifier-state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > "$RUNNER_TEMP/state.json"
+          else
+            : > "$RUNNER_TEMP/state.json"
+          fi
+          cp "$RUNNER_TEMP/state.json" "$RUNNER_TEMP/state.before.json"
+
+      - name: Опубликовать новые зарядки
+        env:
+          ITCHARGE_EMAIL: ${{ secrets.ITCHARGE_EMAIL }}
+          ITCHARGE_PASSWORD: ${{ secrets.ITCHARGE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST: ${{ inputs.test }}
+        run: node notifier/notify.mjs "$RUNNER_TEMP/state.json"
+
+      - name: Сохранить состояние
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cmp -s "$RUNNER_TEMP/state.json" "$RUNNER_TEMP/state.before.json" && exit 0
+          [ -s "$RUNNER_TEMP/state.json" ] || exit 0
+          dir="$RUNNER_TEMP/state-repo"
+          git init -q -b notifier-state "$dir"
+          cp "$RUNNER_TEMP/state.json" "$dir/state.json"
+          cd "$dir"
+          git add state.json
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m 'Состояние уведомлений'
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:notifier-state
+
+      - name: Продлить расписание
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable notify.yml --repo "$GITHUB_REPOSITORY"
