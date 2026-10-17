@@ -1,7 +1,8 @@
-// Публикует в Telegram-канал итог каждой завершённой зарядки из IT Charge.
+// Публикует в Telegram-канал итог каждой завершённой зарядки из IT Charge
+// и сообщает, когда станция теряет связь и когда она восстанавливается.
 // Запускается из GitHub Actions по расписанию: node notifier/notify.mjs <state.json>
-// Состояние — какие зарядки уже опубликованы. Логи репозитория публичные,
-// поэтому в консоль пишутся только счётчики, без данных о зарядках.
+// Состояние — какие зарядки уже опубликованы и о каких обрывах связи сообщено.
+// Логи репозитория публичные, поэтому в консоль пишутся только счётчики.
 import { readFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
@@ -10,6 +11,7 @@ const TENANT = 'itcharge';
 const FINISHED = new Set(['FINISHED_SUCCESS', 'FINISHED_WITH_ERROR', 'CANCELED']);
 const PAGE_SIZE = 50; // столько последних транзакций проверяем за запуск
 const KEEP_IDS = 300;
+const OFFLINE_GRACE_MIN = 5; // короткие переподключения станции тревогу не поднимают
 
 const CONNECTORS = { GBT_DC: 'GB/T DC', GBT_AC: 'GB/T AC', C_TYPE2: 'Type 2', C_TYPE1: 'Type 1', C_CCS2: 'CCS2', C_CHADEMO: 'CHAdeMO' };
 const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс' };
@@ -22,8 +24,11 @@ const timeFmt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-d
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const fmtDuration = (min) => {
   const m = Math.round(min ?? 0);
-  return m < 60 ? `${m} мин` : `${Math.floor(m / 60)} ч ${String(m % 60).padStart(2, '0')} мин`;
+  if (m < 60) return `${m} мин`;
+  if (m < 1440) return `${Math.floor(m / 60)} ч ${String(m % 60).padStart(2, '0')} мин`;
+  return `${Math.floor(m / 1440)} д ${Math.floor((m % 1440) / 60)} ч`;
 };
+const fmtWhen = (date) => `${dateFmt.format(date)}, ${timeFmt.format(date)}`;
 
 export const TX_FIELDS = `
   seqNo id transactionStep startedTimestamp stoppedTimestamp totalKW avgPower maxPower
@@ -83,6 +88,47 @@ export function initState(rows) {
   };
 }
 
+export const STATION_FIELDS = 'id name connected archived disconnectedAt lastConnectionStatusChangedAt';
+
+export function formatOffline(s, since, now) {
+  return [`🔴 <b>${esc(s.name)}</b> — нет связи`, `С ${fmtWhen(since)} · уже ${fmtDuration((now - since) / 60e3)}`].join('\n');
+}
+
+export function formatOnline(s, since, back) {
+  const range = since ? ` (${fmtWhen(since)} – ${timeFmt.format(back)})` : '';
+  return [`🟢 <b>${esc(s.name)}</b> — снова на связи`, since ? `Связи не было ${fmtDuration((back - since) / 60e3)}${range}` : ''].filter(Boolean).join('\n');
+}
+
+// Сообщения о связи станций. Тревога — если станции нет на связи дольше OFFLINE_GRACE_MIN,
+// «снова на связи» — только после отправленной тревоги. Демонтированные (archived) пропускаем.
+// apply() меняет состояние и вызывается только после успешной отправки.
+export function stationEvents(stations, state, now = Date.now()) {
+  state.stations ??= {};
+  const events = [];
+  for (const s of stations) {
+    if (s.archived) continue;
+    const prev = state.stations[s.id] ?? { alerted: false, offlineSince: null };
+    if (!s.connected) {
+      const since = Date.parse(s.disconnectedAt ?? s.lastConnectionStatusChangedAt ?? '') || now;
+      if (!prev.alerted && now - since >= OFFLINE_GRACE_MIN * 60e3) {
+        events.push({ text: formatOffline(s, since, now), apply: () => (state.stations[s.id] = { alerted: true, offlineSince: new Date(since).toISOString() }) });
+      }
+    } else if (prev.alerted) {
+      const since = prev.offlineSince ? Date.parse(prev.offlineSince) : null;
+      const changed = Date.parse(s.lastConnectionStatusChangedAt ?? '');
+      const back = changed && (!since || changed >= since) ? changed : now;
+      events.push({ text: formatOnline(s, since, back), apply: () => (state.stations[s.id] = { alerted: false, offlineSince: null }) });
+    }
+  }
+  return events;
+}
+
+export function formatStatusTest(stations) {
+  const lines = ['🧪 <i>Тестовое сообщение — связь станций сейчас</i>'];
+  for (const s of stations.filter((x) => !x.archived)) lines.push(`${s.connected ? '🟢' : '🔴'} ${esc(s.name)} — ${s.connected ? 'на связи' : 'нет связи'}`);
+  return lines.join('\n');
+}
+
 async function gql(query, variables, token) {
   const headers = { 'content-type': 'application/json', tenant: TENANT, 'x-application-version': '2.0.0-admin-panel' };
   if (token) headers.authorization = token;
@@ -113,6 +159,11 @@ async function latestTransactions(token) {
     token,
   );
   return data.TransactionsList.rows;
+}
+
+async function stationStatuses(token) {
+  const data = await gql(`query { ChargingStationsList(page: { size: 100, number: 1 }) { rows { ${STATION_FIELDS} } } }`, {}, token);
+  return data.ChargingStationsList.rows;
 }
 
 // Приводит id канала к виду, который понимает Telegram: «@имя» или «-100…».
@@ -183,34 +234,37 @@ async function main() {
   let state = raw.trim() ? JSON.parse(raw) : null;
 
   const token = await login(ITCHARGE_EMAIL, ITCHARGE_PASSWORD);
-  const rows = await latestTransactions(token);
+  const [rows, stations] = await Promise.all([latestTransactions(token), stationStatuses(token)]);
 
   if (test) {
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
     if (!last) throw new Error('Нет завершённых зарядок для теста');
     await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, formatMessage(last, { test: true }));
-    console.log('Тестовое сообщение отправлено');
+    await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, formatStatusTest(stations));
+    console.log('Тестовые сообщения отправлены');
   }
 
-  if (!state) {
+  // Первый запуск: старые зарядки не публикуем, а о станциях без связи — сообщаем.
+  const firstRun = !state;
+  if (firstRun) {
     state = initState(rows);
-    await writeFile(statePath, JSON.stringify(state));
     console.log('Первый запуск: текущие зарядки отмечены, публикую только новые');
-    return;
   }
 
-  const fresh = pickNew(rows, state);
+  const stationMsgs = stationEvents(stations, state);
+  const charges = firstRun ? [] : pickNew(rows, state);
+  const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t), apply: () => state.notified.push(t.id) }))];
   let sent = 0;
   try {
-    for (const t of fresh) {
-      await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, formatMessage(t));
-      state.notified.push(t.id);
+    for (const m of queue) {
+      await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, m.text);
+      m.apply();
       sent++;
     }
   } finally {
     state.notified = state.notified.slice(-KEEP_IDS);
     await writeFile(statePath, JSON.stringify(state));
-    console.log(`Новых зарядок: ${fresh.length}, опубликовано: ${sent}`);
+    console.log(`Новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, опубликовано: ${sent}`);
   }
 }
 
