@@ -109,8 +109,8 @@ export function formatMessage(t, { test = false, parallel = null } = {}) {
   const power = [t.avgPower != null && `ср. ${nf1.format(t.avgPower)}`, t.maxPower != null && `макс. ${nf1.format(t.maxPower)}`].filter(Boolean);
   if (power.length) lines.push(`📈 ${power.join(' · ')} кВт`);
   if (parallel) {
-    const who = parallel.count === 1 ? 'ещё одна машина' : `ещё ${parallel.count} ${plural(parallel.count, 'машина', 'машины', 'машин')}`;
-    lines.push(`👥 параллельно заряжалась ${who} · ${fmtDuration(parallel.minutes)} из ${fmtDuration(parallel.of)}`);
+    const who = parallel.count === 1 ? 'заряжалась ещё одна машина' : `заряжались ещё ${parallel.count} ${plural(parallel.count, 'машина', 'машины', 'машин')}`;
+    lines.push(`👥 параллельно ${who} · ${fmtDuration(parallel.minutes)} из ${fmtDuration(parallel.of)}`);
   }
   if (t.idleDuration > 0.5) lines.push(`🅿️ простой после зарядки ${fmtDuration(t.idleDuration)}`);
   if (t.stopInitiator) lines.push(`Остановил: ${esc(INITIATORS[t.stopInitiator] ?? t.stopInitiator.replace(/_/g, ' ').toLowerCase())}`);
