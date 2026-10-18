@@ -1,10 +1,7 @@
-// Публикует в Telegram-канал итог каждой завершённой зарядки из IT Charge
-// и сообщает, когда станция теряет связь и когда она восстанавливается.
-// Запускается из GitHub Actions по расписанию: node notifier/notify.mjs <state.json>
-// Состояние — какие зарядки уже опубликованы и о каких обрывах связи сообщено.
-// Логи репозитория публичные, поэтому в консоль пишутся только счётчики.
-import { readFile, writeFile } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
+// Логика уведомлений в Telegram-канал по станциям IT Charge: итог каждой завершённой
+// зарядки, обрыв и восстановление связи станций, суточный итог в 22:00 МСК.
+// Модуль без зависимостей от окружения: состояние и токен приходят и возвращаются
+// через check(), хранит их вызывающая сторона (Cloudflare Worker, worker/index.mjs).
 
 const API = 'https://api.itcharge.ru/graphql/cp';
 const TENANT = 'itcharge';
@@ -181,6 +178,11 @@ async function gql(query, variables, token) {
   if (token) headers.authorization = token;
   const res = await fetch(API, { method: 'POST', headers, body: JSON.stringify({ query, variables }) });
   const json = await res.json().catch(() => null);
+  if (res.status === 401 || json?.errors?.some((e) => e.extensions?.constant === 'UNAUTHORIZED')) {
+    const err = new Error('IT Charge API: токен не принят');
+    err.auth = true;
+    throw err;
+  }
   if (!json) throw new Error(`IT Charge API: HTTP ${res.status}`);
   if (json.errors?.length) throw new Error(`IT Charge API: ${json.errors[0].message}`);
   return json.data;
@@ -239,7 +241,7 @@ export function normalizeChatId(value) {
   return v;
 }
 
-// Описание формата без самого значения — логи публичные.
+// Описание формата без самого значения — чтобы не светить id канала в логах.
 function describeChatId(value) {
   const v = String(value ?? '');
   if (/^@\w+$/.test(v)) return '@имя';
@@ -275,73 +277,73 @@ async function sendTelegram(botToken, chatId, text) {
   }
 }
 
-async function main() {
-  const { ITCHARGE_EMAIL, ITCHARGE_PASSWORD } = process.env;
-  const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const TELEGRAM_CHAT_ID = normalizeChatId(process.env.TELEGRAM_CHAT_ID);
-  const test = process.env.TEST === 'true';
-  const statePath = process.argv[2] ?? 'state.json';
+// Одна проверка. state — опубликованные зарядки, тревоги, дата последнего итога
+// (null при первом запуске); token — сохранённый токен IT Charge, чтобы не логиниться
+// каждую минуту. Возвращает новое состояние и токен — их нужно сохранить, даже если
+// в result.error пришла ошибка отправки: уже отправленное повторно не уйдёт.
+export async function check({ secrets, state, token, test = false, now = Date.now() }) {
+  const bot = secrets.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = normalizeChatId(secrets.TELEGRAM_CHAT_ID);
+  const creds = { ITCHARGE_EMAIL: secrets.ITCHARGE_EMAIL?.trim(), ITCHARGE_PASSWORD: secrets.ITCHARGE_PASSWORD, TELEGRAM_BOT_TOKEN: bot, TELEGRAM_CHAT_ID: chatId };
+  const missing = Object.entries(creds).filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) return { state, token, log: `Не заданы секреты: ${missing.join(', ')} — пропускаю запуск` };
 
-  const missing = Object.entries({ ITCHARGE_EMAIL, ITCHARGE_PASSWORD, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID })
-    .filter(([, v]) => !v)
-    .map(([k]) => k);
-  if (missing.length) {
-    console.log(`Не заданы секреты: ${missing.join(', ')} — пропускаю запуск`);
-    return;
-  }
+  // Сохранённый токен используем, пока API его принимает; не принял — входим заново.
+  const withToken = async (fn) => {
+    if (!token) token = await login(creds.ITCHARGE_EMAIL, creds.ITCHARGE_PASSWORD);
+    try {
+      return await fn(token);
+    } catch (err) {
+      if (!err.auth) throw err;
+      token = await login(creds.ITCHARGE_EMAIL, creds.ITCHARGE_PASSWORD);
+      return fn(token);
+    }
+  };
 
-  const raw = await readFile(statePath, 'utf8').catch(() => '');
-  let state = raw.trim() ? JSON.parse(raw) : null;
-
-  const token = await login(ITCHARGE_EMAIL, ITCHARGE_PASSWORD);
-  const [rows, stations] = await Promise.all([latestTransactions(token), stationStatuses(token)]);
+  const [rows, stations] = await withToken((t) => Promise.all([latestTransactions(t), stationStatuses(t)]));
+  const log = [];
 
   if (test) {
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
-    if (!last) throw new Error('Нет завершённых зарядок для теста');
-    await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, formatMessage(last, { test: true }));
-    await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, formatStatusTest(stations));
-    console.log('Тестовые сообщения отправлены');
+    if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true }));
+    await sendTelegram(bot, chatId, formatStatusTest(stations));
+    log.push('тестовые сообщения отправлены');
   }
 
   // Первый запуск: старые зарядки не публикуем, а о станциях без связи — сообщаем.
   const firstRun = !state;
   if (firstRun) {
     state = initState(rows);
-    console.log('Первый запуск: текущие зарядки отмечены, публикую только новые');
+    log.push('первый запуск: текущие зарядки отмечены');
   }
 
-  const stationMsgs = stationEvents(stations, state);
+  const stationMsgs = stationEvents(stations, state, now);
   const charges = firstRun ? [] : pickNew(rows, state);
   const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t), apply: () => state.notified.push(t.id) }))];
 
-  // Суточный итог — один раз за сутки, даже если GitHub запустил проверку с опозданием.
-  // Впервые — без отправки: начинаем со следующих 22:00.
-  const end = lastDailyEnd(Date.now());
+  // Суточный итог — один раз за сутки. Впервые — без отправки: начинаем со следующих 22:00.
+  const end = lastDailyEnd(now);
   const key = dailyKey(end);
+  let daily = false;
   if (!state.lastDaily) state.lastDaily = key;
-  else if (state.lastDaily < key && Date.now() - end >= 2 * 60e3) {
-    const txs = await transactionsSince(token, end - 2 * DAY);
+  else if (state.lastDaily < key && now - end >= 60e3) {
+    const txs = await withToken((t) => transactionsSince(t, end - 2 * DAY));
     queue.push({ text: formatDaily(txs, end - DAY, end), apply: () => (state.lastDaily = key) });
+    daily = true;
   }
+
   let sent = 0;
+  let error = null;
   try {
     for (const m of queue) {
-      await sendTelegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, m.text);
+      await sendTelegram(bot, chatId, m.text);
       m.apply();
       sent++;
     }
-  } finally {
-    state.notified = state.notified.slice(-KEEP_IDS);
-    await writeFile(statePath, JSON.stringify(state));
-    const daily = queue.length - stationMsgs.length - charges.length;
-    console.log(`Новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
+  } catch (err) {
+    error = err.message;
   }
-}
-
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((err) => {
-    console.error(err.message);
-    process.exit(1);
-  });
+  state.notified = state.notified.slice(-KEEP_IDS);
+  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
+  return { state, token, log: log.join('; '), error };
 }

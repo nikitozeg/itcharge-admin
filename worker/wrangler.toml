@@ -1,0 +1,17 @@
+# Cloudflare Worker уведомлений: npx wrangler@4 deploy (из папки worker)
+name = "itcharge-notifier"
+main = "index.mjs"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# Проверка каждую минуту (UTC; суточный итог в 22:00 МСК считается в коде)
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "itcharge-notifier"
+database_id = "fab7f8c8-8e04-4a3f-82c4-968e1064488b"
+
+[observability]
+enabled = true
