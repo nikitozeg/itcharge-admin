@@ -63,8 +63,9 @@ export function formatMessage(t, { test = false } = {}) {
   const battery = t.startedPercentage != null && t.percentage != null ? ` · батарея ${t.startedPercentage}% → ${t.percentage}%` : '';
   lines.push(`🔋 <b>${nf2.format(kwh)} кВт⋅ч</b>${battery}`);
 
-  const price = t.tariff?.type === 'PER_KW' && t.tariff?.amount ? ` (${nf2.format(t.tariff.amount)} ₽/кВт⋅ч)` : '';
-  if (rub || t.tariff?.name) lines.push(`💰 <b>${nf2.format(rub)} ₽</b>${t.tariff?.name ? ` · ${esc(t.tariff.name)}${price}` : ''}`);
+  // Цена за кВт⋅ч: из тарифа, если он покиловаттный, иначе — сумма / энергия.
+  const perKwh = t.tariff?.type === 'PER_KW' && t.tariff?.amount ? t.tariff.amount : kwh > 0 && rub ? rub / kwh : null;
+  if (rub || perKwh) lines.push(`💰 <b>${nf2.format(rub)} ₽</b>${perKwh ? ` · ${nf2.format(perKwh)} ₽/кВт⋅ч` : ''}`);
 
   if (start) {
     const when = `${dateFmt.format(start)}, ${timeFmt.format(start)}${stop ? `–${timeFmt.format(stop)}` : ''}`;
