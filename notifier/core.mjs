@@ -58,7 +58,8 @@ export function formatMessage(t, { test = false } = {}) {
 
   const lines = [];
   if (test) lines.push('🧪 <i>Тестовое сообщение — последняя завершённая зарядка</i>');
-  lines.push(`${icon} <b>${esc(t.chargingStation?.name ?? 'Станция')}</b>${conn ? ` · ${esc(conn)}` : ''}${status}`);
+  // Название станции не пишем — её видно по разъёму; без разъёма — название как запасной вариант.
+  lines.push(`${icon} <b>${esc(conn || t.chargingStation?.name || 'Зарядка')}</b>${status}`);
 
   const battery = t.startedPercentage != null && t.percentage != null ? ` · батарея ${t.startedPercentage}% → ${t.percentage}%` : '';
   lines.push(`🔋 <b>${nf2.format(kwh)} кВт⋅ч</b>${battery}`);
