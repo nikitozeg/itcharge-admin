@@ -44,10 +44,44 @@ export const TX_FIELDS = `
   connector { evseId type }
   invoice { amount }
   payment { amount }
-  chargingStation { name }`;
+  chargingStation { id name }`;
+
+// Другие зарядки той же станции, шедшие одновременно с t: сколько машин и сколько минут
+// (пересечения объединяются). Неудачные попытки без энергии и пересечения короче минуты
+// не считаем. rows — последние транзакции; идущие сейчас зарядки длятся до now.
+export function parallelInfo(t, rows, now = Date.now()) {
+  const start = Date.parse(t.startedTimestamp ?? '');
+  const stop = Date.parse(t.stoppedTimestamp ?? '') || now;
+  if (!start) return null;
+  const station = t.chargingStation?.id ?? t.chargingStation?.name;
+  const overlaps = [];
+  for (const o of rows) {
+    if (o.id === t.id || (o.chargingStation?.id ?? o.chargingStation?.name) !== station) continue;
+    const active = o.transactionStep === 'CHARGING' || o.transactionStep === 'CABLE_PLUGGED_IN';
+    if (!(o.totalKW > 0) && !active) continue;
+    const os = Date.parse(o.startedTimestamp ?? '');
+    const oe = Date.parse(o.stoppedTimestamp ?? '') || (active ? now : os);
+    const a = Math.max(start, os);
+    const b = Math.min(stop, oe);
+    if (b - a >= 60e3) overlaps.push([a, b]);
+  }
+  if (!overlaps.length) return null;
+  overlaps.sort((x, y) => x[0] - y[0]);
+  let total = 0;
+  let cur = null;
+  for (const iv of overlaps) {
+    if (cur && iv[0] <= cur[1]) cur[1] = Math.max(cur[1], iv[1]);
+    else {
+      if (cur) total += cur[1] - cur[0];
+      cur = [...iv];
+    }
+  }
+  total += cur[1] - cur[0];
+  return { count: overlaps.length, minutes: total / 60e3, of: t.totalDuration ?? (stop - start) / 60e3 };
+}
 
 // Текст сообщения (HTML-разметка Telegram). Данных клиента в нём нет.
-export function formatMessage(t, { test = false } = {}) {
+export function formatMessage(t, { test = false, parallel = null } = {}) {
   const kwh = t.totalKW ?? 0;
   const rub = t.invoice?.amount ?? t.payment?.amount ?? 0;
   const conn = CONNECTORS[t.connector?.type] ?? t.connector?.type?.replace(/^C_/, '').replace(/_/g, ' ') ?? '';
@@ -74,6 +108,10 @@ export function formatMessage(t, { test = false } = {}) {
   }
   const power = [t.avgPower != null && `ср. ${nf1.format(t.avgPower)}`, t.maxPower != null && `макс. ${nf1.format(t.maxPower)}`].filter(Boolean);
   if (power.length) lines.push(`📈 ${power.join(' · ')} кВт`);
+  if (parallel) {
+    const who = parallel.count === 1 ? 'ещё одна машина' : `ещё ${parallel.count} ${plural(parallel.count, 'машина', 'машины', 'машин')}`;
+    lines.push(`👥 параллельно заряжалась ${who} · ${fmtDuration(parallel.minutes)} из ${fmtDuration(parallel.of)}`);
+  }
   if (t.idleDuration > 0.5) lines.push(`🅿️ простой после зарядки ${fmtDuration(t.idleDuration)}`);
   if (t.stopInitiator) lines.push(`Остановил: ${esc(INITIATORS[t.stopInitiator] ?? t.stopInitiator.replace(/_/g, ' ').toLowerCase())}`);
   return lines.join('\n');
@@ -307,7 +345,7 @@ export async function check({ secrets, state, token, test = false, now = Date.no
 
   if (test) {
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
-    if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true }));
+    if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now) }));
     await sendTelegram(bot, chatId, formatStatusTest(stations));
     log.push('тестовые сообщения отправлены');
   }
@@ -321,7 +359,7 @@ export async function check({ secrets, state, token, test = false, now = Date.no
 
   const stationMsgs = stationEvents(stations, state, now);
   const charges = firstRun ? [] : pickNew(rows, state);
-  const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t), apply: () => state.notified.push(t.id) }))];
+  const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now) }), apply: () => state.notified.push(t.id) }))];
 
   // Суточный итог — один раз за сутки. Впервые — без отправки: начинаем со следующих 22:00.
   const end = lastDailyEnd(now);
