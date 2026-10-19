@@ -17,7 +17,7 @@ const CONNECTORS = { GBT_DC: 'GB/T DC', GBT_AC: 'GB/T AC', C_TYPE2: 'Type 2', C_
 const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс', CAR: 'машина', OCPI: 'роуминг' };
 // Неудачные попытки: тревога, если клиент не начал заряжаться за FAIL_GRACE_MIN после первой попытки.
 const FAIL_GRACE_MIN = 5;
-const FAIL_SERIES_GAP_MIN = 10; // попытки одного клиента с меньшим разрывом — одна серия
+const FAIL_REPEAT_MIN = 20; // вторая неудачная попытка в пределах 20 мин — сразу тревога с телефоном
 const FAIL_FOLLOW_MIN = 60; // столько ждём, что клиент всё же зарядится, чтобы ответить ✅
 const STOP_REASONS = {
   EVDISCONNECTED: 'связь с машиной разорвана', REMOTE: 'остановлено из приложения', LOCAL: 'остановлено кнопкой на станции',
@@ -227,11 +227,13 @@ const isCharge = (r) => r.totalKW > 0 || r.transactionStep === 'CHARGING';
 // Кто пытается заряжаться: клиент на станции; без клиента — разъём станции.
 const whoKey = (r) => `${r.chargingStation?.id ?? r.chargingStation?.name}|${r.authorization?.customer?.id ?? `разъём ${r.connector?.id}`}`;
 
-// Разбор неудачных попыток. Серия — попытки одного клиента на одной станции с разрывом
-// меньше FAIL_SERIES_GAP_MIN. Тревога — если за FAIL_GRACE_MIN от первой попытки клиент так
-// и не начал заряжаться; после тревоги ждём FAIL_FOLLOW_MIN, не зарядится ли он всё же (ответ ✅).
-// Возвращает alerts (новые тревоги) и follows (ответы/закрытие открытых серий); apply()
-// меняет состояние только после успешной отправки.
+// Разбор неудачных попыток. Серия — неудачные попытки одного клиента на одной станции,
+// каждая не позже FAIL_REPEAT_MIN после предыдущей и без удачной зарядки между ними.
+//  • вторая попытка серии — сразу тревога с телефоном клиента (или ответ с телефоном
+//    на уже отправленную тревогу);
+//  • одна попытка — тревога, если за FAIL_GRACE_MIN клиент так и не начал заряжаться;
+//  • зарядился в пределах FAIL_GRACE_MIN — молчим; позже — отвечаем ✅ (ждём FAIL_FOLLOW_MIN).
+// Возвращает alerts и follows; apply() меняет состояние только после успешной отправки.
 export function failureUpdates(rows, state, now = Date.now()) {
   const fails = rows.filter(isFail).sort((a, b) => tStart(a) - tStart(b));
   if (!state.failSeen) {
@@ -242,57 +244,65 @@ export function failureUpdates(rows, state, now = Date.now()) {
   }
   state.failOpen ??= {};
   const seen = new Set(state.failSeen);
-  const charges = rows.filter(isCharge);
-  const successAfter = (key, t0) => charges.filter((c) => whoKey(c) === key && tStart(c) >= t0 - 60e3).sort((a, b) => tStart(a) - tStart(b))[0];
+  const charges = rows.filter(isCharge).sort((a, b) => tStart(a) - tStart(b));
+  const successAfter = (key, t) => charges.find((c) => whoKey(c) === key && tStart(c) >= t - 60e3);
+  const customerOf = (r) => r.authorization?.customer?.id ?? null;
+  const repeatMs = FAIL_REPEAT_MIN * 60e3;
 
+  const alerts = [];
   const follows = [];
-  const openKeys = new Map();
+  const open = new Map(); // key → sid серий, которые ещё ждут
   for (const [sid, o] of Object.entries(state.failOpen)) {
-    openKeys.set(o.key, sid);
     const ok = successAfter(o.key, o.t0);
     if (ok) follows.push({ text: formatFailureFollow(o, ok), replyTo: o.msgId, apply: () => delete state.failOpen[sid] });
-    else if (now - o.alertedAt > FAIL_FOLLOW_MIN * 60e3) follows.push({ silent: true, apply: () => delete state.failOpen[sid] });
+    else if (now - Math.max(o.alertedAt, o.lastFailAt ?? 0) > FAIL_FOLLOW_MIN * 60e3) follows.push({ silent: true, apply: () => delete state.failOpen[sid] });
+    else open.set(o.key, sid);
   }
 
   const byKey = new Map();
   for (const f of fails) {
     if (seen.has(f.id)) continue;
     const key = whoKey(f);
-    const sid = openKeys.get(key);
-    if (sid) {
-      // новая попытка того, о ком уже сообщили, — без повторной тревоги
-      state.failOpen[sid].attempts++;
+    const sid = open.get(key);
+    const o = sid && state.failOpen[sid];
+    if (o && tStart(f) - (o.lastFailAt ?? o.t0) <= repeatMs) {
+      // ещё одна попытка того, о ком уже сообщили: без новой тревоги, но с телефоном, если его не было
+      o.attempts++;
+      o.lastFailAt = tStop(f);
       state.failSeen.push(f.id);
+      if (!o.phoneSent && !o.phoneQueued) {
+        o.phoneQueued = true;
+        alerts.push({ kind: 'phoneReply', series: [f], t0: o.t0, replyTo: o.msgId, txId: f.id, customerId: customerOf(f), needPhone: true,
+          apply: () => { o.phoneSent = true; delete o.phoneQueued; } });
+      }
       continue;
     }
+    if (o) open.delete(key); // прошло больше FAIL_REPEAT_MIN — это уже новая серия
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key).push(f);
   }
+  for (const o of Object.values(state.failOpen)) delete o.phoneQueued;
 
-  const alerts = [];
   for (const [key, list] of byKey) {
     let series = [];
     const flush = () => {
       if (!series.length) return;
       const s = series;
-      const t0 = tStart(s[0]);
-      const ok = successAfter(key, t0);
-      const markSeen = () => state.failSeen.push(...s.map((r) => r.id));
-      if (ok && tStart(ok) - t0 <= FAIL_GRACE_MIN * 60e3) markSeen(); // со второй попытки получилось — не тревожим
-      else if (now - t0 >= FAIL_GRACE_MIN * 60e3) {
-        alerts.push({
-          key, series: s, ok, t0, customerId: s[0].authorization?.customer?.id ?? null,
-          apply: (msgId) => {
-            markSeen();
-            if (!ok) state.failOpen[s[0].id] = { key, t0, attempts: s.length, alertedAt: now, msgId: msgId ?? null };
-          },
-        });
-      }
       series = [];
+      const t0 = tStart(s[0]);
+      const ok = successAfter(key, tStart(s[s.length - 1]));
+      const markSeen = () => state.failSeen.push(...s.map((r) => r.id));
+      const base = { kind: 'new', key, series: s, t0, customerId: customerOf(s[0]), txId: s[s.length - 1].id };
+      const openSeries = (msgId, phoneSent) => (state.failOpen[s[0].id] = { key, t0, attempts: s.length, lastFailAt: tStop(s[s.length - 1]), alertedAt: now, msgId: msgId ?? null, phoneSent });
+      if (ok && tStart(ok) - t0 <= FAIL_GRACE_MIN * 60e3) markSeen(); // быстро получилось — не тревожим
+      else if (ok) alerts.push({ ...base, ok, apply: markSeen }); // уже зарядился, но не сразу — просто сообщаем
+      else if (s.length >= 2) alerts.push({ ...base, needPhone: true, apply: (msgId) => { markSeen(); openSeries(msgId, true); } });
+      else if (now - t0 >= FAIL_GRACE_MIN * 60e3) alerts.push({ ...base, apply: (msgId) => { markSeen(); openSeries(msgId, false); } });
     };
     for (const f of list) {
       const prev = series[series.length - 1];
-      if (prev && tStart(f) - tStop(prev) > FAIL_SERIES_GAP_MIN * 60e3) flush();
+      const succeededBetween = prev && charges.some((c) => whoKey(c) === key && tStart(c) >= tStart(prev) && tStart(c) <= tStart(f));
+      if (prev && (tStart(f) - tStop(prev) > repeatMs || succeededBetween)) flush();
       series.push(f);
     }
     flush();
@@ -302,14 +312,16 @@ export function failureUpdates(rows, state, now = Date.now()) {
 
 const fmtSec = (ms) => (ms < 60e3 ? `${Math.max(1, Math.round(ms / 1000))} сек` : fmtDuration(ms / 60e3));
 
-export function formatFailure(a, { history = null, now = Date.now(), test = false } = {}) {
+// phone: строка с номером (или пояснение, почему номер скрыт) — только для тревог needPhone.
+export function formatFailure(a, { history = null, now = Date.now(), test = false, phone = null } = {}) {
   const s = a.series;
   const f = s[0];
   const conn = CONNECTORS[f.connector?.type] ?? f.connector?.type?.replace(/^C_/, '').replace(/_/g, ' ') ?? '';
   const wait = (a.ok ? tStart(a.ok) : now) - a.t0;
   const lines = [];
   if (test) lines.push('🧪 <i>Тестовое сообщение — последняя неудачная попытка</i>');
-  lines.push(a.ok ? `⚠️ <b>Не получалось зарядиться ${fmtDuration(wait / 60e3)}</b>` : `❌ <b>Не удаётся зарядиться — уже ${fmtDuration(wait / 60e3)}</b>`);
+  if (a.needPhone) lines.push(`📞 <b>${s.length} ${plural(s.length, 'неудачная попытка', 'неудачные попытки', 'неудачных попыток')} подряд — позвоните клиенту</b>`);
+  else lines.push(a.ok ? `⚠️ <b>Не получалось зарядиться ${fmtDuration(wait / 60e3)}</b>` : `❌ <b>Не удаётся зарядиться — уже ${fmtDuration(wait / 60e3)}</b>`);
   const conns = [...new Set(s.map((r) => r.connector?.id).filter((x) => x != null))];
   lines.push(`🔌 <b>${esc(conn || f.chargingStation?.name || 'Станция')}</b>${conns.length ? ` · разъём ${conns.join(', ')}` : ''}`);
   const times = s.map((r) => timeFmt.format(new Date(tStart(r))));
@@ -330,9 +342,18 @@ export function formatFailure(a, { history = null, now = Date.now(), test = fals
     const hist = history == null ? '' : history > 0 ? ` · раньше заряжался у нас ${history} ${plural(history, 'раз', 'раза', 'раз')}` : ' · ни разу не заряжался у нас — возможно, дело в машине';
     lines.push(`👤 клиент №${cust ?? '—'}${hist}`);
   }
+  if (phone) lines.push(`📞 ${esc(phone)}`);
   lines.push(`🧾 ${s.length > 1 ? 'транзакции' : 'транзакция'} ${s.map((r) => `№${r.seqNo}`).join(', ')}`);
   if (a.ok) lines.push(`✅ затем зарядился — через ${fmtDuration((tStart(a.ok) - a.t0) / 60e3)} после первой попытки`);
   return lines.join('\n');
+}
+
+// Ответ на уже отправленную тревогу: клиент снова не смог — телефон, чтобы позвонить.
+export function formatPhoneReply(a, phone) {
+  const f = a.series[0];
+  const who = f.stopInitiator && (INITIATORS[f.stopInitiator] ?? f.stopInitiator.replace(/_/g, ' ').toLowerCase());
+  const cause = [STOP_REASONS[f.stoppedReason] ?? f.stoppedReason?.toLowerCase(), who && `кто остановил — ${who}`].filter(Boolean).join(' · ');
+  return [`📞 <b>Снова не получилось в ${timeFmt.format(new Date(tStart(f)))} — позвоните клиенту</b>`, phone ? `📞 ${esc(phone)}` : null, cause ? `❓ ${esc(cause)}` : null, `🧾 транзакция №${f.seqNo}`].filter(Boolean).join('\n');
 }
 
 function formatFailureFollow(o, ok) {
@@ -398,6 +419,17 @@ async function transactionsSince(token, since) {
 async function stationStatuses(token) {
   const data = await gql(`query { ChargingStationsList(page: { size: 100, number: 1 }) { rows { ${STATION_FIELDS} } } }`, {}, token);
   return data.ChargingStationsList.rows;
+}
+
+// Телефон клиента по транзакции — запрашивается только для тревоги «позвоните клиенту»
+// и нигде не сохраняется.
+async function transactionPhone(token, txId) {
+  const data = await gql(
+    `query($id: FilterUuid) { TransactionsList(id: $id, page: { size: 1, number: 1 }) { rows { authorization { customer { phone } } } } }`,
+    { id: { eq: txId } },
+    token,
+  );
+  return data.TransactionsList.rows[0]?.authorization?.customer?.phone ?? null;
 }
 
 // Сколько раз клиент успешно заряжался на наших станциях — подсказка, машина виновата или станция.
@@ -490,6 +522,15 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   const [rows, stations] = await withToken((t) => Promise.all([latestTransactions(t), stationStatuses(t)]));
   const log = [];
 
+  // Телефон клиента показываем только в закрытом канале: в публичном его увидел бы кто угодно.
+  let channelPublic = null;
+  const phoneText = async (a) => {
+    channelPublic ??= await telegram(bot, 'getChat', { chat_id: chatId }).then((j) => !j.ok || Boolean(j.result?.username)).catch(() => true);
+    const n = a.series[0].authorization?.customer?.seqNo;
+    if (channelPublic) return `номер не показан: канал публичный — клиент №${n ?? '—'} в панели IT Charge`;
+    const phone = await withToken((t) => transactionPhone(t, a.txId)).catch(() => null);
+    return phone ?? 'телефон в профиле клиента не указан';
+  };
   if (test) {
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
     if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now) }));
@@ -498,7 +539,8 @@ export async function check({ secrets, state, token, test = false, now = Date.no
     const sample = failureUpdates(rows, { failSeen: [], failOpen: {} }, now).alerts.sort((a, b) => b.t0 - a.t0)[0];
     if (sample) {
       const history = sample.customerId ? await withToken((t) => customerSuccessCount(t, sample.customerId)) : null;
-      await sendTelegram(bot, chatId, formatFailure(sample, { history, now, test: true }));
+      const phone = sample.needPhone ? await phoneText(sample) : null;
+      await sendTelegram(bot, chatId, formatFailure(sample, { history, now, test: true, phone }));
     }
     log.push('тестовые сообщения отправлены');
   }
@@ -518,8 +560,13 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   for (const f of fail.follows.filter((x) => x.silent)) f.apply();
   const failMsgs = [];
   for (const a of fail.alerts) {
+    const phone = a.needPhone ? await phoneText(a) : null;
+    if (a.kind === 'phoneReply') {
+      failMsgs.push({ text: formatPhoneReply(a, phone), replyTo: a.replyTo, apply: a.apply });
+      continue;
+    }
     const history = a.customerId ? await withToken((t) => customerSuccessCount(t, a.customerId)).catch(() => null) : null;
-    failMsgs.push({ text: formatFailure(a, { history, now }), apply: a.apply });
+    failMsgs.push({ text: formatFailure(a, { history, now, phone }), apply: a.apply });
   }
   const followMsgs = fail.follows.filter((x) => !x.silent);
 
