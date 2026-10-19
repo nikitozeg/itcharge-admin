@@ -14,7 +14,17 @@ const MSK = 3 * 3600e3; // МСК без перехода на летнее вр
 const DAY = 86400e3;
 
 const CONNECTORS = { GBT_DC: 'GB/T DC', GBT_AC: 'GB/T AC', C_TYPE2: 'Type 2', C_TYPE1: 'Type 1', C_CCS2: 'CCS2', C_CHADEMO: 'CHAdeMO' };
-const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс' };
+const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс', CAR: 'машина', OCPI: 'роуминг' };
+// Неудачные попытки: тревога, если клиент не начал заряжаться за FAIL_GRACE_MIN после первой попытки.
+const FAIL_GRACE_MIN = 5;
+const FAIL_SERIES_GAP_MIN = 10; // попытки одного клиента с меньшим разрывом — одна серия
+const FAIL_FOLLOW_MIN = 60; // столько ждём, что клиент всё же зарядится, чтобы ответить ✅
+const STOP_REASONS = {
+  EVDISCONNECTED: 'связь с машиной разорвана', REMOTE: 'остановлено из приложения', LOCAL: 'остановлено кнопкой на станции',
+  OTHER: 'другая причина', TIMEOUT: 'машина не ответила вовремя', DEAUTHORIZED: 'авторизация отклонена', EMERGENCYSTOP: 'аварийная кнопка', POWERLOSS: 'пропало питание',
+  HARDRESET: 'станция перезагрузилась', SOFTRESET: 'станция перезагрузилась', REBOOT: 'станция перезагрузилась', UNLOCKCOMMAND: 'разъём разблокирован',
+};
+const CHARGING_STATES = { EVCONNECTED: 'машина подключена', SUSPENDED_EV: 'машина не берёт ток', SUSPENDED_EVSE: 'станция не даёт ток', IDLE: 'кабель не подключён', CHARGING: 'шла зарядка' };
 
 const nf1 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
 const nf2 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 });
@@ -39,9 +49,10 @@ const plural = (n, one, few, many) => {
 
 export const TX_FIELDS = `
   seqNo id transactionStep startedTimestamp stoppedTimestamp totalKW avgPower maxPower
-  totalDuration idleDuration startedPercentage percentage stopInitiator
+  totalDuration idleDuration startedPercentage percentage stopInitiator stoppedReason chargingState
   tariff { type amount name }
-  connector { evseId type }
+  connector { id evseId type }
+  authorization { customer { id seqNo } }
   invoice { amount }
   payment { amount }
   chargingStation { id name }`;
@@ -207,6 +218,127 @@ export function formatDaily(rows, start, end) {
   return lines.join('\n');
 }
 
+// ---------- неудачные попытки зарядки ----------
+
+const tStart = (r) => Date.parse(r.startedTimestamp ?? '') || 0;
+const tStop = (r) => Date.parse(r.stoppedTimestamp ?? '') || tStart(r);
+const isFail = (r) => (r.transactionStep === 'CANCELED' || r.transactionStep === 'FINISHED_WITH_ERROR') && !(r.totalKW > 0);
+const isCharge = (r) => r.totalKW > 0 || r.transactionStep === 'CHARGING';
+// Кто пытается заряжаться: клиент на станции; без клиента — разъём станции.
+const whoKey = (r) => `${r.chargingStation?.id ?? r.chargingStation?.name}|${r.authorization?.customer?.id ?? `разъём ${r.connector?.id}`}`;
+
+// Разбор неудачных попыток. Серия — попытки одного клиента на одной станции с разрывом
+// меньше FAIL_SERIES_GAP_MIN. Тревога — если за FAIL_GRACE_MIN от первой попытки клиент так
+// и не начал заряжаться; после тревоги ждём FAIL_FOLLOW_MIN, не зарядится ли он всё же (ответ ✅).
+// Возвращает alerts (новые тревоги) и follows (ответы/закрытие открытых серий); apply()
+// меняет состояние только после успешной отправки.
+export function failureUpdates(rows, state, now = Date.now()) {
+  const fails = rows.filter(isFail).sort((a, b) => tStart(a) - tStart(b));
+  if (!state.failSeen) {
+    // впервые — старые отмены не разбираем
+    state.failSeen = fails.map((r) => r.id);
+    state.failOpen = {};
+    return { alerts: [], follows: [] };
+  }
+  state.failOpen ??= {};
+  const seen = new Set(state.failSeen);
+  const charges = rows.filter(isCharge);
+  const successAfter = (key, t0) => charges.filter((c) => whoKey(c) === key && tStart(c) >= t0 - 60e3).sort((a, b) => tStart(a) - tStart(b))[0];
+
+  const follows = [];
+  const openKeys = new Map();
+  for (const [sid, o] of Object.entries(state.failOpen)) {
+    openKeys.set(o.key, sid);
+    const ok = successAfter(o.key, o.t0);
+    if (ok) follows.push({ text: formatFailureFollow(o, ok), replyTo: o.msgId, apply: () => delete state.failOpen[sid] });
+    else if (now - o.alertedAt > FAIL_FOLLOW_MIN * 60e3) follows.push({ silent: true, apply: () => delete state.failOpen[sid] });
+  }
+
+  const byKey = new Map();
+  for (const f of fails) {
+    if (seen.has(f.id)) continue;
+    const key = whoKey(f);
+    const sid = openKeys.get(key);
+    if (sid) {
+      // новая попытка того, о ком уже сообщили, — без повторной тревоги
+      state.failOpen[sid].attempts++;
+      state.failSeen.push(f.id);
+      continue;
+    }
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(f);
+  }
+
+  const alerts = [];
+  for (const [key, list] of byKey) {
+    let series = [];
+    const flush = () => {
+      if (!series.length) return;
+      const s = series;
+      const t0 = tStart(s[0]);
+      const ok = successAfter(key, t0);
+      const markSeen = () => state.failSeen.push(...s.map((r) => r.id));
+      if (ok && tStart(ok) - t0 <= FAIL_GRACE_MIN * 60e3) markSeen(); // со второй попытки получилось — не тревожим
+      else if (now - t0 >= FAIL_GRACE_MIN * 60e3) {
+        alerts.push({
+          key, series: s, ok, t0, customerId: s[0].authorization?.customer?.id ?? null,
+          apply: (msgId) => {
+            markSeen();
+            if (!ok) state.failOpen[s[0].id] = { key, t0, attempts: s.length, alertedAt: now, msgId: msgId ?? null };
+          },
+        });
+      }
+      series = [];
+    };
+    for (const f of list) {
+      const prev = series[series.length - 1];
+      if (prev && tStart(f) - tStop(prev) > FAIL_SERIES_GAP_MIN * 60e3) flush();
+      series.push(f);
+    }
+    flush();
+  }
+  return { alerts, follows };
+}
+
+const fmtSec = (ms) => (ms < 60e3 ? `${Math.max(1, Math.round(ms / 1000))} сек` : fmtDuration(ms / 60e3));
+
+export function formatFailure(a, { history = null, now = Date.now(), test = false } = {}) {
+  const s = a.series;
+  const f = s[0];
+  const conn = CONNECTORS[f.connector?.type] ?? f.connector?.type?.replace(/^C_/, '').replace(/_/g, ' ') ?? '';
+  const wait = (a.ok ? tStart(a.ok) : now) - a.t0;
+  const lines = [];
+  if (test) lines.push('🧪 <i>Тестовое сообщение — последняя неудачная попытка</i>');
+  lines.push(a.ok ? `⚠️ <b>Не получалось зарядиться ${fmtDuration(wait / 60e3)}</b>` : `❌ <b>Не удаётся зарядиться — уже ${fmtDuration(wait / 60e3)}</b>`);
+  const conns = [...new Set(s.map((r) => r.connector?.id).filter((x) => x != null))];
+  lines.push(`🔌 <b>${esc(conn || f.chargingStation?.name || 'Станция')}</b>${conns.length ? ` · разъём ${conns.join(', ')}` : ''}`);
+  const times = s.map((r) => timeFmt.format(new Date(tStart(r))));
+  const durs = s.map((r) => tStop(r) - tStart(r));
+  const durText = s.length === 1 ? `длилась ~${fmtSec(durs[0])}` : durs.every((d) => Math.abs(d - durs[0]) < 30e3) ? `каждая ~${fmtSec(durs[0])}` : durs.map(fmtSec).join(', ');
+  lines.push(`🔁 ${s.length} ${plural(s.length, 'попытка', 'попытки', 'попыток')} · ${times.join(', ')} · ${durText}`);
+  const causes = new Map();
+  for (const r of s) {
+    const who = r.stopInitiator && (INITIATORS[r.stopInitiator] ?? r.stopInitiator.replace(/_/g, ' ').toLowerCase());
+    const c = [STOP_REASONS[r.stoppedReason] ?? r.stoppedReason?.toLowerCase(), who && `кто остановил — ${who}`, CHARGING_STATES[r.chargingState]].filter(Boolean).join(' · ');
+    causes.set(c, (causes.get(c) ?? 0) + 1);
+  }
+  for (const [c, n] of causes) lines.push(`❓ ${esc(c || 'причина не указана')}${s.length > 1 ? ` (${n} из ${s.length})` : ''}`);
+  const soc = s.find((r) => r.startedPercentage != null);
+  if (soc) lines.push(`🔋 машина передала заряд ${soc.startedPercentage}% — связь со станцией была`);
+  const cust = f.authorization?.customer?.seqNo;
+  if (cust != null || history != null) {
+    const hist = history == null ? '' : history > 0 ? ` · раньше заряжался у нас ${history} ${plural(history, 'раз', 'раза', 'раз')}` : ' · ни разу не заряжался у нас — возможно, дело в машине';
+    lines.push(`👤 клиент №${cust ?? '—'}${hist}`);
+  }
+  lines.push(`🧾 ${s.length > 1 ? 'транзакции' : 'транзакция'} ${s.map((r) => `№${r.seqNo}`).join(', ')}`);
+  if (a.ok) lines.push(`✅ затем зарядился — через ${fmtDuration((tStart(a.ok) - a.t0) / 60e3)} после первой попытки`);
+  return lines.join('\n');
+}
+
+function formatFailureFollow(o, ok) {
+  return `✅ Всё же зарядился — через ${fmtDuration((tStart(ok) - o.t0) / 60e3)} после первой попытки, с ${o.attempts + 1}-й попытки`;
+}
+
 export function formatStatusTest(stations) {
   const lines = ['🧪 <i>Тестовое сообщение — связь станций сейчас</i>'];
   for (const s of stations.filter((x) => !x.archived)) lines.push(`${s.connected ? '🟢' : '🔴'} ${esc(s.name)} — ${s.connected ? 'на связи' : 'нет связи'}`);
@@ -268,6 +400,18 @@ async function stationStatuses(token) {
   return data.ChargingStationsList.rows;
 }
 
+// Сколько раз клиент успешно заряжался на наших станциях — подсказка, машина виновата или станция.
+async function customerSuccessCount(token, customerId) {
+  const data = await gql(
+    `query($c: CustomerInputFilter, $s: FilterCompareTransactionSteps) {
+      TransactionsList(customer: $c, transactionStep: $s, page: { size: 1, number: 1 }) { count }
+    }`,
+    { c: { id: { eq: customerId } }, s: { eq: 'FINISHED_SUCCESS' } },
+    token,
+  );
+  return data.TransactionsList.count;
+}
+
 // Приводит id канала к виду, который понимает Telegram: «@имя» или «-100…».
 // Принимает и ссылки t.me/имя, и номер из ссылки t.me/c/<номер>/… без префикса -100.
 export function normalizeChatId(value) {
@@ -303,8 +447,10 @@ async function telegram(botToken, method, payload) {
   return res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
 }
 
-async function sendTelegram(botToken, chatId, text) {
+// Отправляет сообщение (replyTo — ответом на другое) и возвращает его message_id.
+async function sendTelegram(botToken, chatId, text, replyTo = null) {
   const payload = { chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } };
+  if (replyTo) payload.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
   let json = await telegram(botToken, 'sendMessage', payload);
   // Номер канала без -100 (из ссылки t.me/c/…) — пробуем ещё раз с префиксом.
   if (!json.ok && /chat not found/i.test(json.description ?? '') && /^\d+$/.test(chatId)) {
@@ -315,6 +461,7 @@ async function sendTelegram(botToken, chatId, text) {
     const bot = me.ok ? `@${me.result.username}` : 'токен не принят Telegram';
     throw new Error(`Telegram: ${json.description ?? 'ошибка'} · бот: ${bot} · формат TELEGRAM_CHAT_ID: ${describeChatId(chatId)}`);
   }
+  return json.result?.message_id ?? null;
 }
 
 // Одна проверка. state — опубликованные зарядки, тревоги, дата последнего итога
@@ -347,6 +494,12 @@ export async function check({ secrets, state, token, test = false, now = Date.no
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
     if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now) }));
     await sendTelegram(bot, chatId, formatStatusTest(stations));
+    // последняя серия неудачных попыток — чтобы увидеть, как выглядит тревога
+    const sample = failureUpdates(rows, { failSeen: [], failOpen: {} }, now).alerts.sort((a, b) => b.t0 - a.t0)[0];
+    if (sample) {
+      const history = sample.customerId ? await withToken((t) => customerSuccessCount(t, sample.customerId)) : null;
+      await sendTelegram(bot, chatId, formatFailure(sample, { history, now, test: true }));
+    }
     log.push('тестовые сообщения отправлены');
   }
 
@@ -359,7 +512,23 @@ export async function check({ secrets, state, token, test = false, now = Date.no
 
   const stationMsgs = stationEvents(stations, state, now);
   const charges = firstRun ? [] : pickNew(rows, state);
-  const queue = [...stationMsgs, ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now) }), apply: () => state.notified.push(t.id) }))];
+
+  // Неудачные попытки: тревога через FAIL_GRACE_MIN и ответ ✅, если клиент всё же зарядился.
+  const fail = failureUpdates(rows, state, now);
+  for (const f of fail.follows.filter((x) => x.silent)) f.apply();
+  const failMsgs = [];
+  for (const a of fail.alerts) {
+    const history = a.customerId ? await withToken((t) => customerSuccessCount(t, a.customerId)).catch(() => null) : null;
+    failMsgs.push({ text: formatFailure(a, { history, now }), apply: a.apply });
+  }
+  const followMsgs = fail.follows.filter((x) => !x.silent);
+
+  const queue = [
+    ...stationMsgs,
+    ...failMsgs,
+    ...followMsgs,
+    ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now) }), apply: () => state.notified.push(t.id) })),
+  ];
 
   // Суточный итог — один раз за сутки. Впервые — без отправки: начинаем со следующих 22:00.
   const end = lastDailyEnd(now);
@@ -376,14 +545,15 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   let error = null;
   try {
     for (const m of queue) {
-      await sendTelegram(bot, chatId, m.text);
-      m.apply();
+      const msgId = await sendTelegram(bot, chatId, m.text, m.replyTo ?? null);
+      m.apply(msgId);
       sent++;
     }
   } catch (err) {
     error = err.message;
   }
   state.notified = state.notified.slice(-KEEP_IDS);
-  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
+  if (state.failSeen) state.failSeen = state.failSeen.slice(-KEEP_IDS);
+  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
   return { state, token, log: log.join('; '), error };
 }
