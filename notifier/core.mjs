@@ -196,13 +196,14 @@ export function formatDaily(rows, start, end) {
     const stop = Date.parse(r.stoppedTimestamp ?? '');
     if (!FINISHED.has(r.transactionStep) || !(stop >= start && stop < end)) continue;
     const name = r.chargingStation?.name ?? 'Станция';
-    const acc = byStation.get(name) ?? { rub: 0, kwh: 0, count: 0 };
+    const acc = byStation.get(name) ?? { rub: 0, kwh: 0, count: 0, balance: 0 };
     acc.rub += r.invoice?.amount ?? r.payment?.amount ?? 0;
     acc.kwh += r.totalKW ?? 0;
     if (r.totalKW > 0) acc.count++;
+    if (r.totalKW > 0 && r.stopInitiator === 'CSMS_BALANCE_EXCEEDED') acc.balance++; // зарядку остановила система: у клиента кончились деньги
     byStation.set(name, acc);
   }
-  const total = [...byStation.values()].reduce((a, s) => ({ rub: a.rub + s.rub, kwh: a.kwh + s.kwh, count: a.count + s.count }), { rub: 0, kwh: 0, count: 0 });
+  const total = [...byStation.values()].reduce((a, s) => ({ rub: a.rub + s.rub, kwh: a.kwh + s.kwh, count: a.count + s.count, balance: a.balance + s.balance }), { rub: 0, kwh: 0, count: 0, balance: 0 });
   const period = `${dateFmt.format(start)} ${timeFmt.format(start)} – ${dateFmt.format(end)} ${timeFmt.format(end)}`;
   const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
   const lines = [`📊 <b>Итог за сутки</b> · ${period}`];
@@ -211,6 +212,7 @@ export function formatDaily(rows, start, end) {
     return lines.join('\n');
   }
   lines.push(`💰 <b>${nf2.format(total.rub)} ₽</b> · ${total.count} ${plural(total.count, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(total.kwh)} кВт⋅ч`);
+  lines.push(`💳 кончился баланс: ${total.balance} из ${total.count}${total.balance ? ` (${Math.round((total.balance / total.count) * 100)}%)` : ''}`);
   const stations = [...byStation.entries()].filter(([, s]) => s.count).sort((a, b) => b[1].rub - a[1].rub);
   if (stations.length > 1) {
     for (const [name, s] of stations) lines.push(`• ${esc(name)} — ${nf2.format(s.rub)} ₽ · ${s.count} · ${nf0.format(s.kwh)} кВт⋅ч`);
