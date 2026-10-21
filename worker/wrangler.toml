@@ -13,9 +13,5 @@ binding = "DB"
 database_name = "itcharge-notifier"
 database_id = "fab7f8c8-8e04-4a3f-82c4-968e1064488b"
 
-# Свои номера клиентов IT Charge: не уведомлять о них и не считать в суточном итоге
-[vars]
-OWN_CUSTOMERS = "32332,48136"
-
 [observability]
 enabled = true

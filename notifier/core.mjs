@@ -528,11 +528,6 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   };
 
   const [rows, stations] = await withToken((t) => Promise.all([latestTransactions(t), stationStatuses(t)]));
-  // Свои номера (OWN_CUSTOMERS — номера клиентов через запятую) не уведомляем и не считаем в итоге.
-  // В расчёте параллельной зарядки они остаются: их машина тоже делит мощность станции.
-  const own = new Set(String(secrets.OWN_CUSTOMERS ?? '').split(/[\s,;]+/).filter(Boolean).map(Number));
-  const isOwn = (r) => own.has(r.authorization?.customer?.seqNo);
-  const clientRows = rows.filter((r) => !isOwn(r));
   const log = [];
 
   // Телефон клиента показываем только в закрытом канале: в публичном его увидел бы кто угодно.
@@ -545,11 +540,11 @@ export async function check({ secrets, state, token, test = false, now = Date.no
     return phone ?? 'телефон в профиле клиента не указан';
   };
   if (test) {
-    const last = clientRows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
+    const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
     if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now) }));
     await sendTelegram(bot, chatId, formatStatusTest(stations));
     // последняя серия неудачных попыток — чтобы увидеть, как выглядит тревога
-    const sample = failureUpdates(clientRows, { failSeen: [], failOpen: {} }, now).alerts.sort((a, b) => b.t0 - a.t0)[0];
+    const sample = failureUpdates(rows, { failSeen: [], failOpen: {} }, now).alerts.sort((a, b) => b.t0 - a.t0)[0];
     if (sample) {
       const history = sample.customerId ? await withToken((t) => customerSuccessCount(t, sample.customerId)) : null;
       const phone = sample.needPhone ? await phoneText(sample) : null;
@@ -566,10 +561,10 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   }
 
   const stationMsgs = stationEvents(stations, state, now);
-  const charges = firstRun ? [] : pickNew(clientRows, state);
+  const charges = firstRun ? [] : pickNew(rows, state);
 
   // Неудачные попытки: тревога через FAIL_GRACE_MIN и ответ ✅, если клиент всё же зарядился.
-  const fail = failureUpdates(clientRows, state, now);
+  const fail = failureUpdates(rows, state, now);
   for (const f of fail.follows.filter((x) => x.silent)) f.apply();
   const failMsgs = [];
   for (const a of fail.alerts) {
@@ -597,7 +592,7 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   if (!state.lastDaily) state.lastDaily = key;
   else if (state.lastDaily < key && now - end >= 60e3) {
     const txs = await withToken((t) => transactionsSince(t, end - 2 * DAY));
-    queue.push({ text: formatDaily(txs.filter((r) => !isOwn(r)), end - DAY, end), apply: () => (state.lastDaily = key) });
+    queue.push({ text: formatDaily(txs, end - DAY, end), apply: () => (state.lastDaily = key) });
     daily = true;
   }
 
