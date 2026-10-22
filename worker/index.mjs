@@ -23,7 +23,7 @@ async function acquireLock(db, now) {
   return res.meta.changes === 1;
 }
 
-async function runOnce(env, { test = false } = {}) {
+async function runOnce(env, { test = false, monthlyTest = false } = {}) {
   const db = env.DB;
   const now = Date.now();
   if (!(await acquireLock(db, now))) return { log: 'предыдущая проверка ещё идёт — пропускаю' };
@@ -32,7 +32,7 @@ async function runOnce(env, { test = false } = {}) {
     const token = await getKv(db, 'token');
     let result;
     try {
-      result = await check({ secrets: env, state: stateRaw ? JSON.parse(stateRaw) : null, token, test, now });
+      result = await check({ secrets: env, state: stateRaw ? JSON.parse(stateRaw) : null, token, test, monthlyTest, now });
     } catch (err) {
       result = { log: 'проверка не выполнена', error: err.message };
     }
@@ -56,12 +56,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Ручной запуск: POST /run (?test=1 — тестовые сообщения в канал), только с ключом.
+    // Ручной запуск: POST /run (?test=1 — тестовые сообщения, ?monthly=1 — пример месячного итога), только с ключом.
     if (url.pathname === '/run' && request.method === 'POST') {
       if (!env.ADMIN_KEY || request.headers.get('authorization') !== `Bearer ${env.ADMIN_KEY}`) {
         return new Response('forbidden', { status: 403 });
       }
-      const result = await runOnce(env, { test: url.searchParams.get('test') === '1' });
+      const result = await runOnce(env, { test: url.searchParams.get('test') === '1', monthlyTest: url.searchParams.get('monthly') === '1' });
       return Response.json({ log: result.log, error: result.error ?? null });
     }
 

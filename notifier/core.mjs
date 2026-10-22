@@ -196,6 +196,72 @@ export function lastDailyEnd(now) {
 export const dailyKey = (end) => new Date(end + MSK).toISOString().slice(0, 10);
 
 // Итог за сутки [start, end): зарядка относится к суткам, в которые закончилась.
+// ---------- месячный итог (1-го числа в 00:00 МСК) ----------
+
+const MONTH_NAMES = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+// Начало месяца (1-е число, 00:00 МСК) для момента ms, со сдвигом на shift месяцев.
+export function monthStart(ms, shift = 0) {
+  const d = new Date(ms + MSK);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + shift, 1) - MSK;
+}
+export const monthKey = (start) => new Date(start + MSK).toISOString().slice(0, 7);
+const monthTitle = (start) => {
+  const d = new Date(start + MSK);
+  return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+};
+// Завершённые зарядки с энергией, закончившиеся в [start, end).
+const doneIn = (rows, start, end) => rows.filter((r) => {
+  const stop = Date.parse(r.stoppedTimestamp ?? '');
+  return FINISHED.has(r.transactionStep) && r.totalKW > 0 && stop >= start && stop < end;
+});
+const STOP_GROUPS = [['CUSTOMER', 'клиент'], ['CHARGING_STATION', 'станция (машина зарядилась)'], ['CSMS_BALANCE_EXCEEDED', 'кончился баланс']];
+
+// prev — тот же месяц прошлых лет: [{ start, kwh }], от ближнего к дальнему.
+export function formatMonthly(rows, start, end, prev = [], { test = false } = {}) {
+  const done = doneIn(rows, start, end);
+  const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+  const rub = done.reduce((a, r) => a + (r.invoice?.amount ?? r.payment?.amount ?? 0), 0);
+  const kwh = done.reduce((a, r) => a + r.totalKW, 0);
+  const lines = [];
+  if (test) lines.push('🧪 <i>Тестовое сообщение — месячный итог</i>');
+  lines.push(`🗓 <b>Итог за ${monthTitle(start)}</b>`);
+  if (!done.length) {
+    lines.push('💰 <b>0 ₽</b> · зарядок не было');
+    return lines.join('\n');
+  }
+  lines.push(`💰 <b>${nf2.format(rub)} ₽</b> · ${done.length} ${plural(done.length, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(kwh)} кВт⋅ч`);
+  const byStation = new Map();
+  for (const r of done) {
+    const name = r.chargingStation?.name ?? 'Станция';
+    const acc = byStation.get(name) ?? { rub: 0, kwh: 0, count: 0 };
+    acc.rub += r.invoice?.amount ?? r.payment?.amount ?? 0;
+    acc.kwh += r.totalKW;
+    acc.count++;
+    byStation.set(name, acc);
+  }
+  if (byStation.size > 1) {
+    for (const [name, a] of [...byStation].sort((x, y) => y[1].rub - x[1].rub)) lines.push(`• ${esc(name)} — ${nf2.format(a.rub)} ₽ · ${a.count} · ${nf0.format(a.kwh)} кВт⋅ч`);
+  }
+  // кто остановил зарядку
+  const counts = new Map(STOP_GROUPS.map(([k]) => [k, 0]));
+  let other = 0;
+  for (const r of done) counts.has(r.stopInitiator) ? counts.set(r.stopInitiator, counts.get(r.stopInitiator) + 1) : other++;
+  const pct = (n) => `${Math.round((n / done.length) * 100)}% (${n})`;
+  lines.push('🛑 <b>Кто остановил</b>');
+  for (const [k, label] of STOP_GROUPS) lines.push(`• ${label} — ${pct(counts.get(k))}`);
+  if (other) lines.push(`• прочее — ${pct(other)}`);
+  // кВт⋅ч к тому же месяцу прошлых лет
+  if (prev.length) {
+    lines.push('📈 <b>кВт⋅ч к прошлым годам</b>');
+    for (const p of prev) {
+      const d = (kwh / p.kwh - 1) * 100;
+      const arrow = Math.abs(d) < 0.5 ? '•' : d > 0 ? '▲' : '▼';
+      lines.push(`• ${monthTitle(p.start)}: ${nf0.format(p.kwh)} кВт⋅ч → ${arrow} ${d > 0 ? '+' : d < 0 ? '−' : ''}${nf0.format(Math.abs(d))}%`);
+    }
+  } else lines.push('📈 сравнить не с чем — за этот месяц прошлых лет данных нет');
+  return lines.join('\n');
+}
+
 export function formatDaily(rows, start, end) {
   const byStation = new Map();
   for (const r of rows) {
@@ -414,6 +480,38 @@ async function transactionsPage(token, number, size) {
 const latestTransactions = (token) => transactionsPage(token, 1, PAGE_SIZE);
 
 // Все транзакции, начатые после since (страницы идут от новых к старым).
+// Транзакции, созданные в [from, to) — фильтр по дате на стороне API (range), без листания всей истории.
+async function transactionsInRange(token, from, to, fields = TX_FIELDS) {
+  const all = [];
+  for (let page = 1; page <= 15; page++) {
+    const data = await gql(
+      `query($c: FilterCompareTime, $p: Page!) { TransactionsList(createdAt: $c, page: $p, orderBy: [{ seqNo: desc }]) { rows { ${fields} } } }`,
+      { c: { range: [new Date(from).toISOString(), new Date(to).toISOString()] }, p: { size: 100, number: page } },
+      token,
+    );
+    const rows = data.TransactionsList.rows;
+    all.push(...rows);
+    if (rows.length < 100) break;
+  }
+  return all;
+}
+
+// Текст месячного итога за месяц, начинающийся в mStart (зарядки — по времени окончания).
+export async function monthlyReport(withToken, mStart, { test = false } = {}) {
+  const mEnd = monthStart(mStart, 1);
+  const cur = await withToken((t) => transactionsInRange(t, mStart - 2 * DAY, mEnd));
+  const prev = [];
+  for (let n = 1; n <= 5; n++) {
+    const ps = monthStart(mStart, -12 * n);
+    const pe = monthStart(ps, 1);
+    const rows = await withToken((t) => transactionsInRange(t, ps - 2 * DAY, pe, 'transactionStep startedTimestamp stoppedTimestamp totalKW'));
+    if (!rows.length) break; // раньше станций ещё не было
+    const kwh = doneIn(rows, ps, pe).reduce((a, r) => a + r.totalKW, 0);
+    if (kwh > 0) prev.push({ start: ps, kwh });
+  }
+  return formatMonthly(cur, mStart, mEnd, prev, { test });
+}
+
 async function transactionsSince(token, since) {
   const all = [];
   for (let page = 1; page <= 20; page++) {
@@ -508,7 +606,7 @@ async function sendTelegram(botToken, chatId, text, replyTo = null) {
 // (null при первом запуске); token — сохранённый токен IT Charge, чтобы не логиниться
 // каждую минуту. Возвращает новое состояние и токен — их нужно сохранить, даже если
 // в result.error пришла ошибка отправки: уже отправленное повторно не уйдёт.
-export async function check({ secrets, state, token, test = false, now = Date.now() }) {
+export async function check({ secrets, state, token, test = false, monthlyTest = false, now = Date.now() }) {
   const bot = secrets.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = normalizeChatId(secrets.TELEGRAM_CHAT_ID);
   const creds = { ITCHARGE_EMAIL: secrets.ITCHARGE_EMAIL?.trim(), ITCHARGE_PASSWORD: secrets.ITCHARGE_PASSWORD, TELEGRAM_BOT_TOKEN: bot, TELEGRAM_CHAT_ID: chatId };
@@ -596,6 +694,17 @@ export async function check({ secrets, state, token, test = false, now = Date.no
     daily = true;
   }
 
+  // Месячный итог — 1-го числа после 00:00 МСК за прошедший месяц. Впервые — без отправки.
+  const mStart = monthStart(now, -1);
+  const mKey = monthKey(mStart);
+  let monthly = false;
+  if (monthlyTest) queue.push({ text: await monthlyReport(withToken, mStart, { test: true }), apply: () => {} });
+  if (!state.lastMonthly) state.lastMonthly = mKey;
+  else if (state.lastMonthly < mKey && now - monthStart(now) >= 60e3) {
+    queue.push({ text: await monthlyReport(withToken, mStart), apply: () => (state.lastMonthly = mKey) });
+    monthly = true;
+  }
+
   let sent = 0;
   let error = null;
   try {
@@ -609,6 +718,6 @@ export async function check({ secrets, state, token, test = false, now = Date.no
   }
   state.notified = state.notified.slice(-KEEP_IDS);
   if (state.failSeen) state.failSeen = state.failSeen.slice(-KEEP_IDS);
-  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, опубликовано: ${sent}`);
+  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, месячный итог: ${monthly ? 'да' : 'нет'}, опубликовано: ${sent}`);
   return { state, token, log: log.join('; '), error };
 }
