@@ -57,9 +57,11 @@ export const TX_FIELDS = `
   payment { amount }
   chargingStation { id name }`;
 
-// Другие зарядки той же станции, шедшие одновременно с t: сколько машин и сколько минут
-// (пересечения объединяются). Неудачные попытки без энергии и пересечения короче минуты
-// не считаем. rows — последние транзакции; идущие сейчас зарядки длятся до now.
+// Другие машины, заряжавшиеся на той же станции одновременно с t: сколько их было всего,
+// сколько максимум одновременно (не больше, чем свободных разъёмов) и сколько минут
+// суммарно рядом кто-то заряжался. Не считаем: микросессии меньше 1 кВт⋅ч (по сути
+// неудачные старты), касания короче 2 минут и «сессии» на том же разъёме (сбой данных).
+// rows — последние транзакции; идущие сейчас зарядки длятся до now.
 export function parallelInfo(t, rows, now = Date.now()) {
   const start = Date.parse(t.startedTimestamp ?? '');
   const stop = Date.parse(t.stoppedTimestamp ?? '') || now;
@@ -68,27 +70,34 @@ export function parallelInfo(t, rows, now = Date.now()) {
   const overlaps = [];
   for (const o of rows) {
     if (o.id === t.id || (o.chargingStation?.id ?? o.chargingStation?.name) !== station) continue;
+    if (t.connector?.id != null && o.connector?.id === t.connector.id) continue;
     const active = o.transactionStep === 'CHARGING' || o.transactionStep === 'CABLE_PLUGGED_IN';
-    if (!(o.totalKW > 0) && !active) continue;
+    if (!(o.totalKW >= 1) && !active) continue;
     const os = Date.parse(o.startedTimestamp ?? '');
     const oe = Date.parse(o.stoppedTimestamp ?? '') || (active ? now : os);
     const a = Math.max(start, os);
     const b = Math.min(stop, oe);
-    if (b - a >= 60e3) overlaps.push([a, b]);
+    if (b - a >= 2 * 60e3) overlaps.push([a, b]);
   }
   if (!overlaps.length) return null;
+  // максимум одновременно — проходом по началам и концам
+  const ev = overlaps.flatMap(([a, b]) => [[a, 1], [b, -1]]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  let cur = 0;
+  let peak = 0;
+  for (const [, d] of ev) peak = Math.max(peak, (cur += d));
+  // минуты, когда рядом заряжался хоть кто-то (пересечения объединяем)
   overlaps.sort((x, y) => x[0] - y[0]);
   let total = 0;
-  let cur = null;
-  for (const iv of overlaps) {
-    if (cur && iv[0] <= cur[1]) cur[1] = Math.max(cur[1], iv[1]);
+  let iv = null;
+  for (const o of overlaps) {
+    if (iv && o[0] <= iv[1]) iv[1] = Math.max(iv[1], o[1]);
     else {
-      if (cur) total += cur[1] - cur[0];
-      cur = [...iv];
+      if (iv) total += iv[1] - iv[0];
+      iv = [...o];
     }
   }
-  total += cur[1] - cur[0];
-  return { count: overlaps.length, minutes: total / 60e3, of: t.totalDuration ?? (stop - start) / 60e3 };
+  total += iv[1] - iv[0];
+  return { cars: overlaps.length, peak, minutes: total / 60e3, of: t.totalDuration ?? (stop - start) / 60e3 };
 }
 
 // Текст сообщения (HTML-разметка Telegram). Данных клиента в нём нет.
@@ -126,7 +135,12 @@ export function formatMessage(t, { test = false, parallel = null } = {}) {
   const power = [t.avgPower != null && `ср. ${nf1.format(t.avgPower)}`, t.maxPower != null && `макс. ${nf1.format(t.maxPower)}`].filter(Boolean);
   if (power.length) lines.push(`📈 ${power.join(' · ')} кВт`);
   if (parallel) {
-    const who = parallel.count === 1 ? 'заряжалась ещё одна машина' : `заряжались ещё ${parallel.count} ${plural(parallel.count, 'машина', 'машины', 'машин')}`;
+    const { cars, peak } = parallel;
+    const who = peak <= 1
+      ? cars === 1 ? 'заряжалась ещё одна машина' : `заряжались другие машины — по одной, всего ${cars}`
+      : cars === peak
+        ? `заряжались ещё ${peak} ${plural(peak, 'машина', 'машины', 'машин')} одновременно`
+        : `заряжались до ${peak} машин одновременно (всего ${cars})`;
     lines.push(`👥 параллельно ${who} · ${fmtDuration(parallel.minutes)} из ${fmtDuration(parallel.of)}`);
   }
   if (t.idleDuration > 0.5) lines.push(`🅿️ простой после зарядки ${fmtDuration(t.idleDuration)}`);
