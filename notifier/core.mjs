@@ -172,9 +172,15 @@ export function formatOffline(s, since, now) {
   return [`🔴 <b>${esc(s.name)}</b> — нет связи`, `С ${fmtWhen(since)} · уже ${fmtDuration((now - since) / 60e3)}`].join('\n');
 }
 
+// Короткое имя станции: последнее слово названия без пометок в скобках («Йошкар-Ола Кремль АС22» → «АС22»).
+const shortStation = (name) => String(name ?? 'Станция').replace(/\s*\(.*\)\s*$/, '').trim().split(/\s+/).pop();
+
+// «🟢 АС22 - Был оффлайн 32 мин (00:32 – 01:04)»; если обрыв начался в другой день — с датой начала.
 export function formatOnline(s, since, back) {
-  const range = since ? ` (${fmtWhen(since)} – ${timeFmt.format(back)})` : '';
-  return [`🟢 <b>${esc(s.name)}</b> — снова на связи`, since ? `Связи не было ${fmtDuration((back - since) / 60e3)}${range}` : ''].filter(Boolean).join('\n');
+  const name = esc(shortStation(s.name));
+  if (!since) return `🟢 ${name} - снова на связи`;
+  const from = dateFmt.format(since) === dateFmt.format(back) ? timeFmt.format(since) : fmtWhen(since);
+  return `🟢 ${name} - Был оффлайн ${fmtDuration((back - since) / 60e3)} (${from} – ${timeFmt.format(back)})`;
 }
 
 // Сообщения о связи станций. Тревога — если станции нет на связи дольше OFFLINE_GRACE_MIN,
