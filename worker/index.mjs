@@ -3,8 +3,9 @@
 // и отвечает на кнопки статистики (worker/telegram.mjs). Состояние, токен IT Charge
 // и счета лежат в D1; секреты заданы через `wrangler secret put`.
 import { check } from '../notifier/core.mjs';
+import { electricityPerKwh } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
-import { handleUpdate, retryInbox, postMenu, setWebhook, parseInvoicePdf } from './telegram.mjs';
+import { handleUpdate, retryInbox, postMenu, setWebhook, parseInvoicePdf, loadInvoices } from './telegram.mjs';
 
 const LOCK_TTL = 120e3; // проверку дольше двух минут считаем зависшей
 
@@ -26,7 +27,9 @@ async function runOnce(env, { test = false, monthlyTest = false } = {}) {
     const token = await getKv(db, 'token');
     let result;
     try {
-      result = await check({ secrets: env, state: stateRaw ? JSON.parse(stateRaw) : null, token, test, monthlyTest, now });
+      // цена света на кВт⋅ч — по счетам ТНС из D1, только когда есть что публиковать
+      const getCosts = async (monthKwh) => electricityPerKwh(await loadInvoices(db), monthKwh);
+      result = await check({ secrets: env, state: stateRaw ? JSON.parse(stateRaw) : null, token, test, monthlyTest, now, getCosts });
     } catch (err) {
       result = { log: 'проверка не выполнена', error: err.message };
     }

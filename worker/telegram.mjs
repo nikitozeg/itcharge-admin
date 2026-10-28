@@ -25,7 +25,7 @@ function isOurChat(env, chat) {
   return Boolean(chat) && (String(chat.id) === id || (chat.username && `@${chat.username}`.toLowerCase() === id.toLowerCase()));
 }
 
-async function loadInvoices(db) {
+export async function loadInvoices(db) {
   const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg, meters FROM invoices').all();
   return results.map((r) => ({ ...r, meters: r.meters ? JSON.parse(r.meters) : null }));
 }

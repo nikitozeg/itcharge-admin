@@ -1,9 +1,8 @@
 // Счета ТНС энерго за электричество: распознавание, комплект за месяц (аванс 30%,
 // аванс 40%, окончательный), пени и полная статистика месяца для кнопок в канале.
-import { MONTH_NAMES, monthTitle, monthStart, monthKey, doneIn, STOP_GROUPS, shortStation } from './core.mjs';
+import { MONTH_NAMES, monthTitle, monthStart, monthKey, doneIn, STOP_GROUPS, shortStation, IT_CHARGE_FEE } from './core.mjs';
 
 // Расходы помимо электричества (со слов владельца): комиссия IT Charge и постоянные.
-const IT_CHARGE_FEE = 0.06;
 const FIXED_MONTH = 50000 / 12 + 200; // ИП 50 тыс. ₽ в год + связь 200 ₽ в месяц
 const DEFAULT_TARIFF_VAT = 13.34; // ₽/кВт⋅ч с НДС, если в счетах месяца тарифа нет
 const VAT = 0.22;
@@ -157,6 +156,29 @@ const missingText = (st) => st.missing.map((i) => KINDS[i.kind]).join(', ');
 const round2 = (x) => Math.round(x * 100) / 100;
 // Начислено за месяц по окончательному счёту: объём по счётчику × тариф, плюс НДС.
 const monthCharge = (inv) => (inv?.kind === 'final' && inv.kwh && inv.tariff ? round2(round2(inv.kwh * inv.tariff) * (1 + VAT)) : null);
+// Свет за месяц по счетам: окончательный из PDF (весь месяц по счётчику), иначе сумма полного комплекта; null — счетов не хватает.
+const monthElectricity = (st) => monthCharge(st.items.find((i) => i.kind === 'final').inv)
+  ?? (st.complete ? st.items.reduce((a, i) => a + i.inv.amount, 0) : null);
+
+// Сколько стоит свет на 1 кВт⋅ч, отпущенный машинам: начислено ТНС ÷ отпущено по IT Charge за месяцы,
+// где счета известны полностью, — так в цене сразу НДС и потери станции (по счётчику всегда больше, чем машинам).
+// monthKwh — { 'YYYY-MM': кВт⋅ч }. Если таких месяцев нет — тариф из последнего счёта с НДС, без потерь.
+export function electricityPerKwh(invoices, monthKwh = {}) {
+  let rub = 0;
+  let kwh = 0;
+  const months = [];
+  for (const [key, k] of Object.entries(monthKwh)) {
+    const e = k > 0 ? monthElectricity(monthInvoices(invoices, key)) : null;
+    if (e == null) continue;
+    rub += e;
+    kwh += k;
+    months.push(key);
+  }
+  if (kwh > 0) return { perKwh: rub / kwh, months: months.sort() };
+  const last = invoices.filter((i) => i.tariff).sort((a, b) => b.month.localeCompare(a.month))[0];
+  return { perKwh: last ? last.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT, months: [] };
+}
+
 const STATE_ICON = { ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' };
 const invoiceSummary = (inv) => {
   const charge = monthCharge(inv);
@@ -275,11 +297,12 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   const fin = st.items.find((i) => i.kind === 'final').inv;
   const tariffInv = st.items.find((i) => i.inv?.tariff)?.inv;
   const tariffVat = tariffInv ? tariffInv.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT;
-  const billed = st.items.reduce((a, i) => a + (i.inv?.amount ?? 0), 0);
   // точнее всего — окончательный счёт из PDF (весь месяц по счётчику), потом полный комплект счетов, иначе оценка
   const charge = monthCharge(fin);
-  const exact = charge != null || st.complete;
-  const electricity = charge ?? (st.complete ? billed : kwh * tariffVat);
+  const billed = st.items.reduce((a, i) => a + (i.inv?.amount ?? 0), 0);
+  const billedMonth = monthElectricity(st);
+  const exact = billedMonth != null;
+  const electricity = billedMonth ?? kwh * tariffVat;
   const fee = rub * IT_CHARGE_FEE;
 
   // счёт общий на обе станции; ведомость делит его по счётчикам — станцию узнаём по мощности (DC150 → 150, АС22 → 22)

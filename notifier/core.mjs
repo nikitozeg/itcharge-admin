@@ -12,6 +12,8 @@ const OFFLINE_GRACE_MIN = 5; // короткие переподключения 
 const DAILY_HOUR_MSK = 22; // суточный итог: с 22:00 вчера до 22:00 сегодня по Москве
 const MSK = 3 * 3600e3; // МСК без перехода на летнее время
 const DAY = 86400e3;
+export const IT_CHARGE_FEE = 0.06; // комиссия IT Charge: выплата за месяц — ровно 94% выручки (сверено по банку)
+const KWH_MONTHS = 6; // за столько прошлых месяцев помним отпущенные кВт⋅ч — для цены света на кВт⋅ч
 
 const CONNECTORS = { GBT_DC: 'GB/T DC', GBT_AC: 'GB/T AC', C_TYPE2: 'Type 2', C_TYPE1: 'Type 1', C_CCS2: 'CCS2', C_CHADEMO: 'CHAdeMO' };
 const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция', USER: 'оператор', CSMS_BALANCE_EXCEEDED: 'кончился баланс', CAR: 'машина', OCPI: 'роуминг' };
@@ -27,6 +29,7 @@ const STOP_REASONS = {
 const CHARGING_STATES = { EVCONNECTED: 'машина подключена', SUSPENDED_EV: 'машина не берёт ток', SUSPENDED_EVSE: 'станция не даёт ток', IDLE: 'кабель не подключён', CHARGING: 'шла зарядка' };
 
 const nf1 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
+const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
 const nf2 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 });
 const dateFmt = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' });
 const timeFmt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
@@ -101,7 +104,8 @@ export function parallelInfo(t, rows, now = Date.now()) {
 }
 
 // Текст сообщения (HTML-разметка Telegram). Данных клиента в нём нет.
-export function formatMessage(t, { test = false, parallel = null } = {}) {
+// costs.perKwh — сколько стоит свет на 1 кВт⋅ч, отпущенный машине (по счетам ТНС, с НДС и потерями станции).
+export function formatMessage(t, { test = false, parallel = null, costs = null } = {}) {
   const kwh = t.totalKW ?? 0;
   const rub = t.invoice?.amount ?? t.payment?.amount ?? 0;
   const conn = CONNECTORS[t.connector?.type] ?? t.connector?.type?.replace(/^C_/, '').replace(/_/g, ' ') ?? '';
@@ -127,6 +131,13 @@ export function formatMessage(t, { test = false, parallel = null } = {}) {
   lines.push(`🔋 <b>${nf2.format(kwh)} кВт⋅ч</b>${battery}`);
 
   if (rub || perKwh) lines.push(`💰 <b>${nf2.format(rub)} ₽</b>${perKwh ? ` · ${nf2.format(perKwh)} ₽/кВт⋅ч` : ''}`);
+  // чистыми — выручка минус комиссия IT Charge и свет; ИП и связь считаются только в месячной статистике
+  if (costs?.perKwh > 0 && kwh > 0) {
+    const light = kwh * costs.perKwh;
+    const fee = rub * IT_CHARGE_FEE;
+    const net = rub - fee - light;
+    lines.push(`🧮 Чистыми ≈ <b>${net < -0.5 ? '−' : ''}${nf0.format(Math.abs(net))} ₽</b> · свет −${nf0.format(light)} ₽ (${nf2.format(costs.perKwh)} ₽/кВт⋅ч)${fee >= 0.5 ? ` · IT Charge −${nf0.format(fee)} ₽` : ''}`);
+  }
 
   if (start) {
     const when = `${dateFmt.format(start)}, ${timeFmt.format(start)}${stop ? `–${timeFmt.format(stop)}` : ''}`;
@@ -239,7 +250,6 @@ export const STOP_GROUPS = [['CUSTOMER', 'клиент'], ['CHARGING_STATION', '
 // prev — тот же месяц прошлых лет: [{ start, kwh }], от ближнего к дальнему.
 export function formatMonthly(rows, start, end, prev = [], { test = false } = {}) {
   const done = doneIn(rows, start, end);
-  const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
   const rub = done.reduce((a, r) => a + (r.invoice?.amount ?? r.payment?.amount ?? 0), 0);
   const kwh = done.reduce((a, r) => a + r.totalKW, 0);
   const lines = [];
@@ -297,7 +307,6 @@ export function formatDaily(rows, start, end) {
   }
   const total = [...byStation.values()].reduce((a, s) => ({ rub: a.rub + s.rub, kwh: a.kwh + s.kwh, count: a.count + s.count, balance: a.balance + s.balance }), { rub: 0, kwh: 0, count: 0, balance: 0 });
   const period = `${dateFmt.format(start)} ${timeFmt.format(start)} – ${dateFmt.format(end)} ${timeFmt.format(end)}`;
-  const nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
   const lines = [`📊 <b>Итог за сутки</b> · ${period}`];
   if (!total.count) {
     lines.push(`💰 <b>${nf2.format(total.rub)} ₽</b> · зарядок не было`);
@@ -517,6 +526,18 @@ async function transactionsInRange(token, from, to, fields = TX_FIELDS) {
 }
 
 // Данные месяца, начинающегося в mStart: транзакции месяца и кВт⋅ч того же месяца прошлых лет.
+// Отпущено машинам по месяцам за последние KWH_MONTHS полных месяцев: { 'YYYY-MM': кВт⋅ч }.
+async function deliveredByMonth(withToken, now) {
+  const out = {};
+  for (let n = 1; n <= KWH_MONTHS; n++) {
+    const ms = monthStart(now, -n);
+    const me = monthStart(ms, 1);
+    const rows = await withToken((t) => transactionsInRange(t, ms - 2 * DAY, me, 'transactionStep startedTimestamp stoppedTimestamp totalKW'));
+    out[monthKey(ms)] = Math.round(doneIn(rows, ms, me).reduce((a, r) => a + r.totalKW, 0) * 1000) / 1000;
+  }
+  return out;
+}
+
 export async function monthData(withToken, mStart) {
   const mEnd = monthStart(mStart, 1);
   const cur = await withToken((t) => transactionsInRange(t, mStart - 2 * DAY, mEnd));
@@ -652,7 +673,8 @@ export const tgCall = (botToken, method, payload) => telegram(botToken, method, 
 // (null при первом запуске); token — сохранённый токен IT Charge, чтобы не логиниться
 // каждую минуту. Возвращает новое состояние и токен — их нужно сохранить, даже если
 // в result.error пришла ошибка отправки: уже отправленное повторно не уйдёт.
-export async function check({ secrets, state, token, test = false, monthlyTest = false, now = Date.now() }) {
+// getCosts(monthKwh) — цена света на кВт⋅ч по счетам ТНС (их хранит вызывающая сторона); без неё строки «чистыми» нет.
+export async function check({ secrets, state, token, test = false, monthlyTest = false, now = Date.now(), getCosts = null }) {
   const bot = secrets.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = normalizeChatId(secrets.TELEGRAM_CHAT_ID);
   const creds = { ITCHARGE_EMAIL: secrets.ITCHARGE_EMAIL?.trim(), ITCHARGE_PASSWORD: secrets.ITCHARGE_PASSWORD, TELEGRAM_BOT_TOKEN: bot, TELEGRAM_CHAT_ID: chatId };
@@ -674,9 +696,19 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
     const phone = await withToken((t) => transactionPhone(t, a.txId)).catch(() => null);
     return phone ?? 'телефон в профиле клиента не указан';
   };
+  // отпущенные кВт⋅ч за прошлые месяцы — раз в месяц, через 10 минут после его начала (в 00:00 идёт месячный итог)
+  const curKey = monthKey(monthStart(now));
+  if (state && state.kwhFor !== curKey && now - monthStart(now) >= 10 * 60e3) {
+    state.monthKwh = await deliveredByMonth(withToken, now);
+    state.kwhFor = curKey;
+    log.push('отпущенные кВт⋅ч по месяцам обновлены');
+  }
+  let costs;
+  const loadCosts = async () => (costs ??= getCosts ? await getCosts(state?.monthKwh ?? {}).catch(() => null) : null);
+
   if (test) {
     const last = rows.find((r) => r.transactionStep === 'FINISHED_SUCCESS' && r.totalKW > 0);
-    if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now) }));
+    if (last) await sendTelegram(bot, chatId, formatMessage(last, { test: true, parallel: parallelInfo(last, rows, now), costs: await loadCosts() }));
     await sendTelegram(bot, chatId, formatStatusTest(stations));
     // последняя серия неудачных попыток — чтобы увидеть, как выглядит тревога
     const sample = failureUpdates(rows, { failSeen: [], failOpen: {} }, now).alerts.sort((a, b) => b.t0 - a.t0)[0];
@@ -713,11 +745,12 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   }
   const followMsgs = fail.follows.filter((x) => !x.silent);
 
+  if (charges.length) await loadCosts();
   const queue = [
     ...stationMsgs,
     ...failMsgs,
     ...followMsgs,
-    ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now) }), apply: () => state.notified.push(t.id) })),
+    ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now), costs }), apply: () => state.notified.push(t.id) })),
   ];
 
   // Суточный итог — один раз за сутки. Впервые — без отправки: начинаем со следующих 22:00.
