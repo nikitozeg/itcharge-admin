@@ -86,16 +86,34 @@ export async function processInbox(env, docMsg) {
 }
 
 // Сохранить счёт и ответить в канале: принят / уже есть + чего не хватает за месяц.
+// Аванс и окончательный бывают один раз в месяц: тот же вид за тот же месяц — это тот же счёт.
+// Если он был введён вручную, PDF дополняет запись (номер, кВт⋅ч, тариф), а не дублирует её.
+// Пеней в месяце может быть несколько: их сверяем по номеру, а с ручной записью — по сумме.
 async function saveInvoice(env, inv, docMsg, chat) {
   const db = env.DB;
-  const id = inv.number ?? `manual-${docMsg}`;
-  const ins = await db.prepare('INSERT OR IGNORE INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)')
-    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString())
-    .run();
-  const duplicate = ins.meta.changes !== 1;
+  let id = inv.number ?? `manual-${docMsg}`;
+  let same;
+  if (inv.kind !== 'penalty') same = await db.prepare('SELECT * FROM invoices WHERE month = ?1 AND kind = ?2').bind(inv.month, inv.kind).first();
+  else {
+    same = await db.prepare('SELECT * FROM invoices WHERE id = ?1 OR number = ?1').bind(id).first();
+    if (!same && inv.number) {
+      same = await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND number IS NULL AND month = ?1 AND abs(amount - ?2) < 0.005").bind(inv.month, inv.amount).first();
+    }
+  }
+  let mode = 'new';
+  if (same && inv.number && !same.number) {
+    await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7 WHERE id = ?1')
+      .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg).run();
+    mode = 'updated';
+    id = same.id;
+  } else if (same) mode = 'duplicate';
+  else {
+    await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)')
+      .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString()).run();
+  }
   const st = monthInvoices(await loadInvoices(db), inv.month);
-  const r = await send(env, chat, formatInvoiceAck(inv, st, { duplicate }), { ...replyTo(docMsg), reply_markup: statsButtons(inv.month) });
-  if (!duplicate && r.ok) await db.prepare('UPDATE invoices SET ack_msg = ?2 WHERE id = ?1').bind(id, r.result.message_id).run();
+  const r = await send(env, chat, formatInvoiceAck(inv, st, { mode, existing: same }), { ...replyTo(docMsg), reply_markup: statsButtons(inv.month) });
+  if (mode !== 'duplicate' && r.ok) await db.prepare('UPDATE invoices SET ack_msg = ?2 WHERE id = ?1').bind(id, r.result.message_id).run();
 }
 
 // ---------- текст в канале: команды, ручной ввод, удаление ----------

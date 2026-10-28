@@ -63,8 +63,9 @@ export function parseManual(text, now = Date.now()) {
   const t = text.toLowerCase();
   const kind = /\b30\s*%/.test(t) ? 'adv30' : /\b40\s*%/.test(t) ? 'adv40' : /оконч|финал|итог/.test(t) ? 'final' : /пен/.test(t) ? 'penalty' : null;
   const mWord = t.split(/[\s,.;]+/).find((w) => /^[а-яё]{3,}$/.test(w) && monthIndex(w) >= 0 && !/оконч|финал|пен|аванс/.test(w));
-  // сумма — последнее число с копейками; год и проценты убираем, чтобы не склеились с ней
-  const amountM = t.replace(/\b(30|40)\s*%/g, ' ').replace(/\b20\d\d\b/g, ' ').match(/-?\d[\d\s]*[.,]\d{1,2}(?!\d)/g);
+  // сумма — последнее число (с копейками или целое); год и проценты убираем, чтобы не склеились с ней
+  const rest = t.replace(/\b(30|40)\s*%/g, ' ').replace(/\b20\d\d\b/g, ' ');
+  const amountM = rest.match(/-?\d[\d\s]*[.,]\d{1,2}(?!\d)/g) ?? rest.match(/\d[\d\s]*\d|\d/g);
   if (!kind || !mWord || !amountM) return null;
   const m = monthIndex(mWord);
   const yearM = t.match(/\b(20\d\d)\b/);
@@ -99,10 +100,15 @@ const dateRu = (ms) => {
 };
 const missingText = (st) => st.missing.map((i) => KINDS[i.kind]).join(', ');
 
-// Ответ на загруженный счёт.
-export function formatInvoiceAck(inv, st, { duplicate = false } = {}) {
+// Ответ на загруженный счёт. mode: new | updated (была ручная запись) | duplicate (такой уже есть).
+export function formatInvoiceAck(inv, st, { mode = 'new', existing = null } = {}) {
   const title = monthTitle(startOfKey(inv.month));
-  const lines = [duplicate ? `♻️ <b>Этот счёт уже есть</b> — ${KINDS[inv.kind]} за ${title}` : `📄 <b>Счёт принят:</b> ${KINDS[inv.kind]} за ${title}`];
+  const head = {
+    new: `📄 <b>Счёт принят:</b> ${KINDS[inv.kind]} за ${title}`,
+    updated: `📄 <b>Счёт принят:</b> ${KINDS[inv.kind]} за ${title} — дополнил запись, введённую вручную`,
+    duplicate: `♻️ <b>Уже есть</b> ${KINDS[inv.kind]} за ${title}${existing && Math.abs(existing.amount - inv.amount) > 0.005 ? ` на ${nf2.format(existing.amount)} ₽ — этот счёт не добавил. Если он исправленный, ответь «удалить» на старый и загрузи снова` : ''}`,
+  }[mode];
+  const lines = [head];
   lines.push(`💰 ${nf2.format(inv.amount)} ₽${inv.kwh != null ? ` · ${nf2.format(inv.kwh)} кВт⋅ч` : ''}${inv.number ? ` · №${esc(inv.number)}` : ''}`);
   lines.push(`🧾 За ${title}: ${st.items.map((i) => `${{ ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' }[i.state]} ${KINDS[i.kind]}`).join(' · ')}`);
   if (st.missing.length) lines.push(`⚠️ Не хватает: ${missingText(st)}`);
@@ -141,8 +147,11 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   const kwh = done.reduce((a, r) => a + r.totalKW, 0);
   const title = monthTitle(mStart);
   const lines = [`📊 <b>${title[0].toUpperCase() + title.slice(1)} — полная статистика</b>`];
-  if (mEnd > now) lines.push(`<i>месяц ещё идёт — данные по ${dateRu(now)}</i>`);
-  lines.push(`💰 Выручка: <b>${nf2.format(rub)} ₽</b> · ${done.length} ${plural(done.length, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(kwh)} кВт⋅ч`);
+  // счёт на аванс 30% выставляют 1-го, поэтому следующий месяц может быть в меню раньше, чем начался
+  const future = mStart > now;
+  if (future) lines.push('<i>месяц ещё не начался — пока только счета</i>');
+  else if (mEnd > now) lines.push(`<i>месяц ещё идёт — данные по ${dateRu(now)}</i>`);
+  if (!future) lines.push(`💰 Выручка: <b>${nf2.format(rub)} ₽</b> · ${done.length} ${plural(done.length, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(kwh)} кВт⋅ч`);
   const byStation = new Map();
   for (const r of done) {
     const a = byStation.get(r.chargingStation?.name) ?? { rub: 0, kwh: 0, n: 0 };
@@ -151,7 +160,7 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
     a.n++;
     byStation.set(r.chargingStation?.name, a);
   }
-  if (byStation.size > 1) for (const [name, a] of [...byStation].sort((x, y) => y[1].rub - x[1].rub)) lines.push(`• ${esc(shortStation(name))} — ${nf2.format(a.rub)} ₽ · ${a.n} · ${nf0.format(a.kwh)} кВт⋅ч`);
+  if (byStation.size > 1 && !future) for (const [name, a] of [...byStation].sort((x, y) => y[1].rub - x[1].rub)) lines.push(`• ${esc(shortStation(name))} — ${nf2.format(a.rub)} ₽ · ${a.n} · ${nf0.format(a.kwh)} кВт⋅ч`);
   if (done.length) {
     const counts = new Map(STOP_GROUPS.map(([k]) => [k, 0]));
     let other = 0;
@@ -161,7 +170,7 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
     if (other) parts.push(`прочее ${pct(other)}`);
     lines.push(`🛑 Кто остановил: ${parts.join(' · ')}`);
   }
-  if (prev.length && kwh > 0) {
+  if (prev.length && kwh > 0 && !future) {
     lines.push(`📈 кВт⋅ч к прошлым годам: ${prev.map((p) => {
       const d = (kwh / p.kwh - 1) * 100;
       return `${new Date(p.start + MSK).getUTCFullYear()} ${Math.abs(d) < 0.5 ? '•' : d > 0 ? '▲ +' : '▼ −'}${nf0.format(Math.abs(d))}%`;
@@ -179,6 +188,7 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   if (!st.tracking && !st.items.some((i) => i.inv)) lines.push('⚪ счета за этот месяц не загружены');
   const pen = st.penalties.reduce((a, i) => a + i.amount, 0);
   if (st.penalties.length) lines.push(`💸 пени — ${nf2.format(pen)} ₽`);
+  if (future) return lines.join('\n');
 
   // прибыль: электричество по счетам, если комплект полный; иначе — оценка по отпущенным кВт⋅ч
   const tariffInv = st.items.find((i) => i.inv?.tariff)?.inv;
