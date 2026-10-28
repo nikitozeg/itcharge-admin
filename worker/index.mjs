@@ -1,18 +1,12 @@
 // Cloudflare Worker: раз в минуту проверяет IT Charge и пишет в Telegram-канал
-// (логика — notifier/core.mjs). Состояние и токен IT Charge лежат в D1, в таблице kv;
-// секреты заданы через `wrangler secret put`.
+// (логика — notifier/core.mjs), а через вебхук принимает из канала счета ТНС энерго
+// и отвечает на кнопки статистики (worker/telegram.mjs). Состояние, токен IT Charge
+// и счета лежат в D1; секреты заданы через `wrangler secret put`.
 import { check } from '../notifier/core.mjs';
+import { getKv, setKv } from './db.mjs';
+import { handleUpdate, retryInbox, postMenu, setWebhook, parseInvoicePdf } from './telegram.mjs';
 
 const LOCK_TTL = 120e3; // проверку дольше двух минут считаем зависшей
-
-async function getKv(db, k) {
-  const row = await db.prepare('SELECT v FROM kv WHERE k = ?1').bind(k).first();
-  return row ? row.v : null;
-}
-
-async function setKv(db, k, v) {
-  await db.prepare('INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v').bind(k, v).run();
-}
 
 // Две проверки одновременно (cron и ручной запуск) отправили бы одно и то же дважды.
 async function acquireLock(db, now) {
@@ -50,17 +44,35 @@ export default {
   async scheduled(event, env) {
     const result = await runOnce(env);
     console.log(result.log);
+    // счёт, который не успел разобраться при загрузке, — после основной проверки, чтобы её не задерживать
+    await retryInbox(env).catch((err) => console.log('очередь счетов:', err.message));
     if (result.error) throw new Error(result.error);
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Ручной запуск: POST /run (?test=1 — тестовые сообщения, ?monthly=1 — пример месячного итога), только с ключом.
+    // Вебхук Telegram: счета в канале и кнопки. Секрет — в заголовке, который ставит Telegram.
+    if (url.pathname === '/tg' && request.method === 'POST') {
+      if (!env.TG_WEBHOOK_SECRET || request.headers.get('x-telegram-bot-api-secret-token') !== env.TG_WEBHOOK_SECRET) {
+        return new Response('forbidden', { status: 403 });
+      }
+      const update = await request.json().catch(() => null);
+      if (update) ctx.waitUntil(handleUpdate(env, update, ctx).catch((err) => console.log('telegram:', err.message)));
+      return new Response('ok');
+    }
+
+    // Ручной запуск: POST /run (?test=1 — тестовые сообщения, ?monthly=1 — пример месячного итога,
+    // ?setup=webhook, ?menu=1, ?parse=1), только с ключом.
     if (url.pathname === '/run' && request.method === 'POST') {
       if (!env.ADMIN_KEY || request.headers.get('authorization') !== `Bearer ${env.ADMIN_KEY}`) {
         return new Response('forbidden', { status: 403 });
       }
+      // ?setup=webhook — подключить вебхук Telegram; ?menu=1 — выложить в канал меню с месяцами
+      if (url.searchParams.get('setup') === 'webhook') return Response.json(await setWebhook(env, url.origin));
+      if (url.searchParams.get('menu') === '1') return Response.json(await postMenu(env));
+      // ?parse=1 с PDF в теле — проверить распознавание счёта, ничего не сохраняя
+      if (url.searchParams.get('parse') === '1') return Response.json(await parseInvoicePdf(new Uint8Array(await request.arrayBuffer())));
       const result = await runOnce(env, { test: url.searchParams.get('test') === '1', monthlyTest: url.searchParams.get('monthly') === '1' });
       return Response.json({ log: result.log, error: result.error ?? null });
     }

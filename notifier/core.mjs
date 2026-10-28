@@ -173,7 +173,7 @@ export function formatOffline(s, since, now) {
 }
 
 // Короткое имя станции: последнее слово названия без пометок в скобках («Йошкар-Ола Кремль АС22» → «АС22»).
-const shortStation = (name) => String(name ?? 'Станция').replace(/\s*\(.*\)\s*$/, '').trim().split(/\s+/).pop();
+export const shortStation = (name) => String(name ?? 'Станция').replace(/\s*\(.*\)\s*$/, '').trim().split(/\s+/).pop();
 
 // «🟢 АС22 - Был оффлайн 32 мин (00:32 – 01:04)»; если обрыв начался в другой день — с датой начала.
 export function formatOnline(s, since, back) {
@@ -218,23 +218,23 @@ export const dailyKey = (end) => new Date(end + MSK).toISOString().slice(0, 10);
 // Итог за сутки [start, end): зарядка относится к суткам, в которые закончилась.
 // ---------- месячный итог (1-го числа в 00:00 МСК) ----------
 
-const MONTH_NAMES = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+export const MONTH_NAMES = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
 // Начало месяца (1-е число, 00:00 МСК) для момента ms, со сдвигом на shift месяцев.
 export function monthStart(ms, shift = 0) {
   const d = new Date(ms + MSK);
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + shift, 1) - MSK;
 }
 export const monthKey = (start) => new Date(start + MSK).toISOString().slice(0, 7);
-const monthTitle = (start) => {
+export const monthTitle = (start) => {
   const d = new Date(start + MSK);
   return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 };
 // Завершённые зарядки с энергией, закончившиеся в [start, end).
-const doneIn = (rows, start, end) => rows.filter((r) => {
+export const doneIn = (rows, start, end) => rows.filter((r) => {
   const stop = Date.parse(r.stoppedTimestamp ?? '');
   return FINISHED.has(r.transactionStep) && r.totalKW > 0 && stop >= start && stop < end;
 });
-const STOP_GROUPS = [['CUSTOMER', 'клиент'], ['CHARGING_STATION', 'станция (машина зарядилась)'], ['CSMS_BALANCE_EXCEEDED', 'кончился баланс']];
+export const STOP_GROUPS = [['CUSTOMER', 'клиент'], ['CHARGING_STATION', 'станция (машина зарядилась)'], ['CSMS_BALANCE_EXCEEDED', 'кончился баланс']];
 
 // prev — тот же месяц прошлых лет: [{ start, kwh }], от ближнего к дальнему.
 export function formatMonthly(rows, start, end, prev = [], { test = false } = {}) {
@@ -516,8 +516,8 @@ async function transactionsInRange(token, from, to, fields = TX_FIELDS) {
   return all;
 }
 
-// Текст месячного итога за месяц, начинающийся в mStart (зарядки — по времени окончания).
-export async function monthlyReport(withToken, mStart, { test = false } = {}) {
+// Данные месяца, начинающегося в mStart: транзакции месяца и кВт⋅ч того же месяца прошлых лет.
+export async function monthData(withToken, mStart) {
   const mEnd = monthStart(mStart, 1);
   const cur = await withToken((t) => transactionsInRange(t, mStart - 2 * DAY, mEnd));
   const prev = [];
@@ -529,6 +529,12 @@ export async function monthlyReport(withToken, mStart, { test = false } = {}) {
     const kwh = doneIn(rows, ps, pe).reduce((a, r) => a + r.totalKW, 0);
     if (kwh > 0) prev.push({ start: ps, kwh });
   }
+  return { cur, prev, mStart, mEnd };
+}
+
+// Текст месячного итога за месяц, начинающийся в mStart (зарядки — по времени окончания).
+export async function monthlyReport(withToken, mStart, { test = false } = {}) {
+  const { cur, prev, mEnd } = await monthData(withToken, mStart);
   return formatMonthly(cur, mStart, mEnd, prev, { test });
 }
 
@@ -622,6 +628,26 @@ async function sendTelegram(botToken, chatId, text, replyTo = null) {
   return json.result?.message_id ?? null;
 }
 
+// Доступ к API IT Charge: сохранённый токен используем, пока API его принимает; не принял — входим заново.
+// token() отдаёт актуальный токен, чтобы его сохранить.
+export function itchargeClient(secrets, token) {
+  const email = secrets.ITCHARGE_EMAIL?.trim();
+  const password = secrets.ITCHARGE_PASSWORD;
+  const withToken = async (fn) => {
+    if (!token) token = await login(email, password);
+    try {
+      return await fn(token);
+    } catch (err) {
+      if (!err.auth) throw err;
+      token = await login(email, password);
+      return fn(token);
+    }
+  };
+  return { withToken, token: () => token };
+}
+
+export const tgCall = (botToken, method, payload) => telegram(botToken, method, payload);
+
 // Одна проверка. state — опубликованные зарядки, тревоги, дата последнего итога
 // (null при первом запуске); token — сохранённый токен IT Charge, чтобы не логиниться
 // каждую минуту. Возвращает новое состояние и токен — их нужно сохранить, даже если
@@ -633,17 +659,8 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   const missing = Object.entries(creds).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) return { state, token, log: `Не заданы секреты: ${missing.join(', ')} — пропускаю запуск` };
 
-  // Сохранённый токен используем, пока API его принимает; не принял — входим заново.
-  const withToken = async (fn) => {
-    if (!token) token = await login(creds.ITCHARGE_EMAIL, creds.ITCHARGE_PASSWORD);
-    try {
-      return await fn(token);
-    } catch (err) {
-      if (!err.auth) throw err;
-      token = await login(creds.ITCHARGE_EMAIL, creds.ITCHARGE_PASSWORD);
-      return fn(token);
-    }
-  };
+  const client = itchargeClient(secrets, token);
+  const withToken = client.withToken;
 
   const [rows, stations] = await withToken((t) => Promise.all([latestTransactions(t), stationStatuses(t)]));
   const log = [];
@@ -739,5 +756,5 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   state.notified = state.notified.slice(-KEEP_IDS);
   if (state.failSeen) state.failSeen = state.failSeen.slice(-KEEP_IDS);
   log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, месячный итог: ${monthly ? 'да' : 'нет'}, опубликовано: ${sent}`);
-  return { state, token, log: log.join('; '), error };
+  return { state, token: client.token(), log: log.join('; '), error };
 }
