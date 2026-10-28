@@ -31,7 +31,8 @@ export const KINDS = { adv30: 'аванс 30%', adv40: 'аванс 40%', final: 
 
 // Строки PDF → счета. ТНС присылает пакетом: окончательный за месяц, аванс 40% и 30% на следующие, УПД
 // и ведомость; каждый счёт начинается со строки «СЧЕТ № …». Отдельный счёт на пени — так же, один в файле.
-// Каждый счёт: { number, issued, kind, month: 'YYYY-MM', amount, kwh, tariff } (+ id у пеней из окончательного).
+// Каждый счёт: { number, issued, kind, month: 'YYYY-MM', amount, kwh, tariff } (+ id у пеней из окончательного;
+// у окончательного ещё accrued — начислено за месяц с НДС — и meters из ведомости).
 export function parseInvoices(lines) {
   if (!/ТНС энерго|электроэнерги/i.test(lines.join('\n'))) return [];
   const starts = lines.flatMap((l, i) => (/^СЧЕТ(\s|$)/.test(l.trim()) ? [i] : []));
@@ -44,8 +45,28 @@ export function parseInvoices(lines) {
   // счёт общий на обе станции; ведомость делит его по точкам учёта — кладём её к окончательному за тот же месяц
   const sheet = parseSheet(lines);
   const fin = sheet && invs.find((i) => i.kind === 'final' && i.month === sheet.month);
-  if (fin) fin.meters = sheet.meters;
+  if (fin) {
+    fin.meters = sheet.meters;
+    // в старых пакетах строка энергии — по каждой точке учёта отдельно; объём месяца — сумма по ведомости
+    fin.kwh = Math.round(sheet.meters.reduce((a, m) => a + m.kwh, 0) * 1000) / 1000;
+    fin.accrued ??= round2(sheet.meters.reduce((a, m) => a + m.rub, 0));
+  }
   return invs;
+}
+
+// Акт сверки (раз в квартал в пакете) — начислено за каждый месяц с начала года:
+// «Счет-фактура № 1000/23700/01 от 30.04.2026  41 928,10», дата иногда переносится на следующую строку.
+// → [{ month: 'YYYY-MM', accrued }]
+export function parseAct(lines) {
+  const at = lines.findIndex((l) => /^АКТ СВЕРКИ/.test(l.trim()));
+  if (at < 0) return [];
+  const out = new Map();
+  for (let i = at; i < lines.length; i++) {
+    const m = lines[i].match(/Счет-фактура\s*№\s*\S+\s+от\s*(\d{2}\.\d{2}\.\d{4})?\s+(-?\d[\d\s]*,\d{2})\s*$/);
+    const date = m && (m[1] ?? lines[i + 1]?.trim().match(/^\d{2}\.\d{2}\.\d{4}$/)?.[0]);
+    if (date) out.set(`${date.slice(6)}-${date.slice(3, 5)}`, ruNum(m[2]));
+  }
+  return [...out].map(([month, accrued]) => ({ month, accrued }));
 }
 
 // Ведомость электропотребления: строка точки учёта —
@@ -64,8 +85,8 @@ function parseSheet(lines) {
     const num = (c) => (/^-?[\d\s]+(,\d+)?$/.test(c ?? '') ? ruNum(c) : NaN);
     const kwh = num(cells.at(-2));
     const rub = num(cells.at(-1));
-    // мощность — за три колонки до типа показаний (OUT): «… 150  1929  1981  OUT»
-    const type = cells.findIndex((c) => /^[A-Z]{2,4}$/.test(c));
+    // мощность — за три колонки до типа показаний (OUT, бывает и «ДС»): «… 150  1929  1981  OUT»
+    const type = cells.findIndex((c) => /^[A-ZА-ЯЁ]{2,4}$/.test(c));
     const power = type > 3 ? num(cells[type - 3]) : NaN;
     if (!Number.isNaN(kwh) && !Number.isNaN(rub)) meters.push({ point: cells[0], power: Number.isNaN(power) ? null : power, kwh, rub });
   }
@@ -91,11 +112,12 @@ function parseOne(lines) {
   const kind = per[1] === '30' ? 'adv30' : per[1] === '40' ? 'adv40' : per[1] ? null : 'final';
   if (!kind) return [];
   const month = keyOf(Number(per[3]), monthIndex(per[2]));
-  // строка с энергией: «1  НН: электроэнергия … (менее 670 кВт)  982,89  10,93252  10 745,46  2 364,00  13 109,46»
-  const row = lines.find((l) => /электроэнергия/i.test(l) && l.split(/\s{2,}/).length >= 5);
-  if (row) {
-    const vals = rowNums(row);
-    if (vals.length >= 2) [inv.kwh, inv.tariff] = vals;
+  // строки с энергией: «1  НН: электроэнергия … (менее 670 кВт)  982,89  10,93252  10 745,46  2 364,00  13 109,46»;
+  // в старых счетах — по строке на каждую точку учёта, объём складываем
+  const rows = lines.map((l) => l.trim()).filter((l) => /^\d+\s+\S+:\s*электроэнергия/i.test(l)).map(rowNums).filter((v) => v.length >= 2);
+  if (rows.length) {
+    inv.kwh = Math.round(rows.reduce((a, v) => a + v[0], 0) * 1000) / 1000;
+    inv.tariff = rows[0][1];
   }
   if (kind !== 'final') return payM ? [{ ...inv, amount: ruNum(payM[1]), kind, month }] : [];
   // окончательный: «Итого к оплате по счёту» — остаток после авансов (последняя колонка строки «Электроэнергия»),
@@ -104,7 +126,8 @@ function parseOne(lines) {
   const totalM = text.match(/Всего с НДС:?\s*(-?[\d\s]+,\d{2})/i);
   const amount = debt ? rowNums(debt).at(-1) : totalM ? ruNum(totalM[1]) : undefined;
   if (amount == null) return [];
-  const out = [{ ...inv, amount, kind, month }];
+  // к оплате бывает 0, если авансы переплатили; начислено за месяц — колонка «Начислено» той же строки
+  const out = [{ ...inv, amount, kind, month, accrued: debt ? rowNums(debt)[1] ?? null : null }];
   const peni = lines.find((l) => /^\d+\s+ПЕНИ(\s|$)/i.test(l.trim()));
   const accrued = peni ? rowNums(peni)[1] : 0; // колонки: долг на начало, начислено, перерасчёт, оплачено, …
   if (accrued > 0) out.push({ id: `${numM[1]}-пени`, number: numM[1], issued, amount: accrued, kwh: null, tariff: null, kind: 'penalty', month });
@@ -154,11 +177,19 @@ const dateRu = (ms) => {
 const missingText = (st) => st.missing.map((i) => KINDS[i.kind]).join(', ');
 
 const round2 = (x) => Math.round(x * 100) / 100;
-// Начислено за месяц по окончательному счёту: объём по счётчику × тариф, плюс НДС.
-const monthCharge = (inv) => (inv?.kind === 'final' && inv.kwh && inv.tariff ? round2(round2(inv.kwh * inv.tariff) * (1 + VAT)) : null);
-// Свет за месяц по счетам: окончательный из PDF (весь месяц по счётчику), иначе сумма полного комплекта; null — счетов не хватает.
-const monthElectricity = (st) => monthCharge(st.items.find((i) => i.kind === 'final').inv)
-  ?? (st.complete ? st.items.reduce((a, i) => a + i.inv.amount, 0) : null);
+const meterList = (inv) => (typeof inv?.meters === 'string' ? JSON.parse(inv.meters) : inv?.meters); // из D1 приходит строкой
+// Начислено за месяц по окончательному счёту (или по акту сверки), с НДС: из таблицы задолженности,
+// иначе сумма по ведомости, иначе объём × тариф + НДС. Сумма авансов и «к оплате» для этого не годится:
+// переплата переходит на следующий месяц, и окончательный бывает нулевым.
+const monthCharge = (inv) => {
+  if (inv?.kind !== 'final') return null;
+  if (inv.accrued != null) return inv.accrued;
+  const m = meterList(inv);
+  if (m?.length) return round2(m.reduce((a, x) => a + x.rub, 0));
+  return inv.kwh && inv.tariff ? round2(round2(inv.kwh * inv.tariff) * (1 + VAT)) : null;
+};
+// Свет за месяц по счетам — начислено по окончательному или акту сверки; null — пока неизвестно.
+const monthElectricity = (st) => monthCharge(st.items.find((i) => i.kind === 'final').inv);
 
 // Сколько стоит свет на 1 кВт⋅ч, отпущенный машинам: начислено ТНС ÷ отпущено по IT Charge за месяцы,
 // где счета известны полностью, — так в цене сразу НДС и потери станции (по счётчику всегда больше, чем машинам).
@@ -193,15 +224,15 @@ export function monthTariff(invoices, key) {
 const STATE_ICON = { ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' };
 const invoiceSummary = (inv) => {
   const charge = monthCharge(inv);
-  if (charge != null) return `к оплате ${nf2.format(inv.amount)} ₽ · за месяц начислено ${nf2.format(charge)} ₽ за ${nf2.format(inv.kwh)} кВт⋅ч по счётчикам обеих станций`;
+  if (charge != null) return `к оплате ${nf2.format(inv.amount)} ₽ · за месяц начислено ${nf2.format(charge)} ₽${inv.kwh ? ` за ${nf2.format(inv.kwh)} кВт⋅ч по счётчикам обеих станций` : ' (по акту сверки)'}`;
   return `${nf2.format(inv.amount)} ₽${inv.kwh != null ? ` · ${nf2.format(inv.kwh)} кВт⋅ч` : ''}`;
 };
 const updatedNote = ({ mode, existing, inv }) => (mode !== 'updated' ? ''
   : ` — дополнил запись, введённую вручную${Math.abs(existing.amount - inv.amount) > 0.005 ? ` (там было ${nf2.format(existing.amount)} ₽)` : ''}`);
 
 // Ответ на загруженный файл. results: [{ inv, mode: new | updated (была ручная запись) | duplicate, existing }],
-// statuses: месяц → monthInvoices(…) для месяцев из файла.
-export function formatInvoiceAck(results, statuses) {
+// statuses: месяц → monthInvoices(…) для месяцев из файла; actMonths — месяцы, где акт сверки уточнил начисление.
+export function formatInvoiceAck(results, statuses, { actMonths = [] } = {}) {
   const lines = [];
   const titleOf = (inv) => monthTitle(startOfKey(inv.month));
   if (results.length === 1) {
@@ -227,6 +258,7 @@ export function formatInvoiceAck(results, statuses) {
     if (st.missing.length) lines.push(`⚠️ Не хватает${sts.length > 1 ? ` за ${title}` : ''}: ${missingText(st)}`);
     else if (st.complete && sts.length === 1) lines.push('✅ Все счета за месяц на месте');
   }
+  if (actMonths.length) lines.push(`📑 По акту сверки уточнил начисления: ${actMonths.map((k) => monthTitle(startOfKey(k))).join(', ')}`);
   return lines.join('\n');
 }
 
@@ -254,7 +286,8 @@ export function monthsKeyboard(invoices, now = Date.now()) {
 export const MENU_TEXT = '📅 <b>Статистика по месяцам</b>\nНажми месяц — покажу выручку, зарядки, счета ТНС энерго и прибыль.\n✅ — все счета на месте · ⚠️ — какого-то счёта не хватает';
 
 // Полная статистика месяца: зарядки из IT Charge + счета ТНС + прибыль.
-export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Date.now()) {
+// costs — electricityPerKwh(…): им оцениваем свет, пока окончательного счёта нет.
+export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Date.now(), { costs = null } = {}) {
   const key = monthKey(mStart);
   const done = doneIn(cur, mStart, mEnd);
   const rub = done.reduce((a, r) => a + (r.invoice?.amount ?? r.payment?.amount ?? 0), 0);
@@ -314,23 +347,25 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   const billed = st.items.reduce((a, i) => a + (i.inv?.amount ?? 0), 0);
   const billedMonth = monthElectricity(st);
   const exact = billedMonth != null;
-  const electricity = billedMonth ?? kwh * tariffVat;
+  const estPerKwh = costs?.months?.length ? costs.perKwh : tariffVat; // средняя по счетам — с потерями станции
+  const electricity = billedMonth ?? kwh * estPerKwh;
   const fee = rub * IT_CHARGE_FEE;
 
   // счёт общий на обе станции; ведомость делит его по счётчикам — станцию узнаём по мощности (DC150 → 150, АС22 → 22)
   const perStation = [];
-  const meters = typeof fin?.meters === 'string' ? JSON.parse(fin.meters) : fin?.meters; // из D1 приходит строкой
+  const meters = meterList(fin);
   if (meters?.length) {
     lines.push('🔌 Счёт общий на обе станции, по счётчикам:');
     for (const m of meters) {
       const name = [...byStation.keys()].find((n) => m.power != null && shortStation(n ?? '').replace(/\D/g, '') === String(m.power));
       const a = byStation.get(name) ?? { rub: 0, kwh: 0 };
       const label = name ? esc(shortStation(name)) : m.power != null ? `станция ${nf0.format(m.power)} кВт` : `точка ${m.point}`;
-      const loss = m.kwh > 0 ? ` (разница ${nf0.format(((m.kwh - a.kwh) / m.kwh) * 100)}%)` : '';
+      const d = m.kwh > 0 ? ((m.kwh - a.kwh) / m.kwh) * 100 : null; // меньше нуля — показания сдвинулись между месяцами
+      const loss = d != null ? ` (разница ${d <= -0.5 ? '−' : ''}${nf0.format(Math.abs(d))}%)` : '';
       lines.push(`• ${label} — ${nf0.format(m.kwh)} кВт⋅ч на ${nf0.format(m.rub)} ₽ · машинам ${nf0.format(a.kwh)}${loss}`);
       perStation.push({ label, profit: a.rub - m.rub - a.rub * IT_CHARGE_FEE });
     }
-  } else if (charge != null && kwh > 0) {
+  } else if (charge != null && fin.kwh > 0 && kwh > 0) {
     const diff = fin.kwh - kwh;
     lines.push(`🔌 По счётчикам обеих станций ${nf0.format(fin.kwh)} кВт⋅ч, машинам отпущено ${nf0.format(kwh)} — разница ${nf0.format(diff)} кВт⋅ч (${nf0.format((diff / fin.kwh) * 100)}%)`);
   }
@@ -356,7 +391,8 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
     lines.push(`по станциям (выручка − свет − комиссия): ${perStation.map((x) => `${x.label} ${x.profit < 0 ? '−' : ''}${nf0.format(Math.abs(x.profit))} ₽`).join(' · ')}`);
   }
   if (!exact) {
-    lines.push(`<i>электричество оценено по отпущенным кВт⋅ч обеих станций × ${nf2.format(tariffVat)} ₽${billed ? `; по счетам уже ${nf0.format(billed)} ₽` : ''}</i>`);
+    const how = estPerKwh === tariffVat ? `× ${nf2.format(tariffVat)} ₽ (тариф с НДС)` : `× ${nf2.format(estPerKwh)} ₽ — столько по счетам ТНС стоил кВт⋅ч машинам за ${costs.months.length} ${plural(costs.months.length, 'месяц', 'месяца', 'месяцев')}`;
+    lines.push(`<i>электричество оценено: отпущено машинам ${nf0.format(kwh)} кВт⋅ч ${how}${billed ? `; по счетам уже ${nf0.format(billed)} ₽` : ''}</i>`);
   }
   if (st.missing.length) lines.push('', `⚠️ <b>Не хватает:</b> ${missingText(st)}`);
   return lines.join('\n');

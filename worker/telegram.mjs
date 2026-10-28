@@ -1,7 +1,7 @@
 // Обновления Telegram (вебхук): счета ТНС энерго в канале и кнопки статистики по месяцам.
 import { normalizeChatId, tgCall, itchargeClient, monthData, monthTitle } from '../notifier/core.mjs';
 import { pdfLines } from '../notifier/pdf.mjs';
-import { parseInvoices, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, MENU_TEXT, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
+import { parseInvoices, parseAct, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, electricityPerKwh, MENU_TEXT, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
 
 const MAX_ATTEMPTS = 3;
@@ -26,7 +26,7 @@ function isOurChat(env, chat) {
 }
 
 export async function loadInvoices(db) {
-  const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg, meters FROM invoices').all();
+  const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg, meters, accrued FROM invoices').all();
   return results.map((r) => ({ ...r, meters: r.meters ? JSON.parse(r.meters) : null }));
 }
 
@@ -70,10 +70,13 @@ export async function processInbox(env, docMsg) {
     return done();
   }
   let invs = [];
+  let act = [];
   try {
     const f = await tg(env, 'getFile', { file_id: row.file_id });
     const res = await fetch(`https://api.telegram.org/file/bot${bot(env)}/${f.result.file_path}`);
-    invs = parseInvoices(await pdfLines(new Uint8Array(await res.arrayBuffer()), inflate));
+    const lines = await pdfLines(new Uint8Array(await res.arrayBuffer()), inflate);
+    invs = parseInvoices(lines);
+    act = parseAct(lines);
   } catch (err) {
     console.log('счёт не прочитан:', err.message);
   }
@@ -81,45 +84,68 @@ export async function processInbox(env, docMsg) {
     await send(env, row.chat_id, UNRECOGNIZED, replyTo(docMsg));
     return done();
   }
-  await saveInvoices(env, invs, docMsg, row.chat_id);
+  await saveInvoices(env, invs, docMsg, row.chat_id, act);
   await done();
 }
 
 // Сохранить счёт. Аванс и окончательный бывают один раз в месяц: тот же вид за тот же месяц — это тот же счёт.
 // Если он был введён вручную, PDF дополняет запись (номер, кВт⋅ч, тариф), а не дублирует её.
-// Пеней в месяце может быть несколько: их сверяем по id, а с другими — по сумме за тот же месяц.
+// Пеней в месяце может быть несколько: их сверяем по id, а с другими — по сумме за тот же месяц;
+// пени из PDF без совпадения по сумме дополняют введённые вручную за тот же месяц (там их обычно округляли).
 const meters = (inv) => (inv.meters?.length ? JSON.stringify(inv.meters) : null);
 
-async function storeInvoice(db, inv, docMsg) {
+export async function storeInvoice(db, inv, docMsg) {
   const id = inv.id ?? inv.number ?? `manual-${docMsg}`;
   let same;
   if (inv.kind !== 'penalty') same = await db.prepare('SELECT * FROM invoices WHERE month = ?1 AND kind = ?2').bind(inv.month, inv.kind).first();
   else {
     same = await db.prepare('SELECT * FROM invoices WHERE id = ?1').bind(id).first();
     if (!same && inv.number) {
-      same = await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND month = ?1 AND abs(amount - ?2) < 0.005").bind(inv.month, inv.amount).first();
+      same = await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND month = ?1 AND abs(amount - ?2) < 0.005").bind(inv.month, inv.amount).first()
+        ?? await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND month = ?1 AND number IS NULL").bind(inv.month).first();
     }
   }
   if (same && inv.number && !same.number) {
-    await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7, meters = ?8 WHERE id = ?1')
-      .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, meters(inv)).run();
+    await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7, meters = ?8, accrued = ?9 WHERE id = ?1')
+      .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, meters(inv), inv.accrued ?? null).run();
     return { inv, mode: 'updated', existing: same, id: same.id };
   }
-  if (same) return { inv, mode: 'duplicate', existing: same, id: same.id };
-  await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added, meters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)')
-    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString(), meters(inv)).run();
+  if (same) {
+    // тот же документ загрузили ещё раз (например, после обновления бота) — дописываем то, чего раньше не разбирали
+    if (inv.number && same.number === inv.number) {
+      await db.prepare('UPDATE invoices SET kwh = ?2, meters = COALESCE(?3, meters), accrued = COALESCE(?4, accrued) WHERE id = ?1')
+        .bind(same.id, inv.kwh ?? same.kwh, meters(inv), inv.accrued ?? null).run();
+    }
+    return { inv, mode: 'duplicate', existing: same, id: same.id };
+  }
+  await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added, meters, accrued) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)')
+    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString(), meters(inv), inv.accrued ?? null).run();
   return { inv, mode: 'new', existing: null, id };
 }
 
+// Начисления из акта сверки — к окончательным счетам тех месяцев (если окончательный введён вручную, начисления
+// в нём нет). Возвращает месяцы, где что-то поменялось.
+export async function applyAct(db, act) {
+  const changed = [];
+  for (const { month, accrued } of act) {
+    const r = await db.prepare("UPDATE invoices SET accrued = ?2 WHERE kind = 'final' AND month = ?1 AND (accrued IS NULL OR abs(accrued - ?2) >= 0.005)").bind(month, accrued).run();
+    if (r.meta.changes) changed.push(month);
+  }
+  return changed;
+}
+
 // Сохранить счета из файла (в пакете ТНС их несколько) и ответить одним сообщением: что принято и чего не хватает.
-async function saveInvoices(env, invs, docMsg, chat) {
+async function saveInvoices(env, invs, docMsg, chat, act = []) {
   const db = env.DB;
   const results = [];
   for (const inv of invs) results.push(await storeInvoice(db, inv, docMsg));
+  // начисления окончательных из самого пакета не трогаем — акт уточняет только остальные месяцы
+  const own = new Set(invs.filter((i) => i.kind === 'final').map((i) => i.month));
+  const actMonths = await applyAct(db, act.filter((a) => !own.has(a.month)));
   const all = await loadInvoices(db);
   const statuses = new Map([...new Set(invs.map((i) => i.month))].sort().map((m) => [m, monthInvoices(all, m)]));
   const firstMonth = [...statuses.keys()][0];
-  const r = await send(env, chat, formatInvoiceAck(results, statuses), { ...replyTo(docMsg), reply_markup: statsButtons(firstMonth) });
+  const r = await send(env, chat, formatInvoiceAck(results, statuses, { actMonths }), { ...replyTo(docMsg), reply_markup: statsButtons(firstMonth) });
   if (!r.ok) return;
   // ответ «удалить» на это сообщение снимет все счета из файла
   for (const x of results) if (x.mode !== 'duplicate') await db.prepare('UPDATE invoices SET ack_msg = ?2 WHERE id = ?1').bind(x.id, r.result.message_id).run();
@@ -172,7 +198,10 @@ async function onCallback(env, cb) {
   const client = itchargeClient(env, saved);
   let text;
   try {
-    text = formatMonthStats(await monthData(client.withToken, startOfKey(m[1])), await loadInvoices(db));
+    const invoices = await loadInvoices(db);
+    // пока окончательного нет, свет оцениваем по средней цене кВт⋅ч машинам из прошлых счетов
+    const monthKwh = JSON.parse((await getKv(db, 'state')) ?? '{}').monthKwh ?? {};
+    text = formatMonthStats(await monthData(client.withToken, startOfKey(m[1])), invoices, Date.now(), { costs: electricityPerKwh(invoices, monthKwh) });
   } catch (err) {
     text = `⚠️ Не получилось собрать статистику: ${err.message}`;
   }
@@ -190,7 +219,7 @@ export async function retryInbox(env) {
 
 export async function parseInvoicePdf(bytes) {
   const lines = await pdfLines(bytes, inflate);
-  return { invoices: parseInvoices(lines), lines: lines.length };
+  return { invoices: parseInvoices(lines), act: parseAct(lines), lines: lines.length };
 }
 
 export async function postMenu(env) {
