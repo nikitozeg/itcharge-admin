@@ -1,7 +1,7 @@
 // Обновления Telegram (вебхук): счета ТНС энерго в канале и кнопки статистики по месяцам.
 import { normalizeChatId, tgCall, itchargeClient, monthData, monthTitle } from '../notifier/core.mjs';
 import { pdfLines } from '../notifier/pdf.mjs';
-import { parseInvoice, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, MENU_TEXT, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
+import { parseInvoices, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, MENU_TEXT, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
 
 const MAX_ATTEMPTS = 3;
@@ -69,51 +69,58 @@ export async function processInbox(env, docMsg) {
     await send(env, row.chat_id, UNRECOGNIZED, replyTo(docMsg));
     return done();
   }
-  let inv = null;
+  let invs = [];
   try {
     const f = await tg(env, 'getFile', { file_id: row.file_id });
     const res = await fetch(`https://api.telegram.org/file/bot${bot(env)}/${f.result.file_path}`);
-    inv = parseInvoice(await pdfLines(new Uint8Array(await res.arrayBuffer()), inflate));
+    invs = parseInvoices(await pdfLines(new Uint8Array(await res.arrayBuffer()), inflate));
   } catch (err) {
     console.log('счёт не прочитан:', err.message);
   }
-  if (!inv) {
+  if (!invs.length) {
     await send(env, row.chat_id, UNRECOGNIZED, replyTo(docMsg));
     return done();
   }
-  await saveInvoice(env, inv, docMsg, row.chat_id);
+  await saveInvoices(env, invs, docMsg, row.chat_id);
   await done();
 }
 
-// Сохранить счёт и ответить в канале: принят / уже есть + чего не хватает за месяц.
-// Аванс и окончательный бывают один раз в месяц: тот же вид за тот же месяц — это тот же счёт.
+// Сохранить счёт. Аванс и окончательный бывают один раз в месяц: тот же вид за тот же месяц — это тот же счёт.
 // Если он был введён вручную, PDF дополняет запись (номер, кВт⋅ч, тариф), а не дублирует её.
-// Пеней в месяце может быть несколько: их сверяем по номеру, а с ручной записью — по сумме.
-async function saveInvoice(env, inv, docMsg, chat) {
-  const db = env.DB;
-  let id = inv.number ?? `manual-${docMsg}`;
+// Пеней в месяце может быть несколько: их сверяем по id, а с другими — по сумме за тот же месяц.
+async function storeInvoice(db, inv, docMsg) {
+  const id = inv.id ?? inv.number ?? `manual-${docMsg}`;
   let same;
   if (inv.kind !== 'penalty') same = await db.prepare('SELECT * FROM invoices WHERE month = ?1 AND kind = ?2').bind(inv.month, inv.kind).first();
   else {
-    same = await db.prepare('SELECT * FROM invoices WHERE id = ?1 OR number = ?1').bind(id).first();
+    same = await db.prepare('SELECT * FROM invoices WHERE id = ?1').bind(id).first();
     if (!same && inv.number) {
-      same = await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND number IS NULL AND month = ?1 AND abs(amount - ?2) < 0.005").bind(inv.month, inv.amount).first();
+      same = await db.prepare("SELECT * FROM invoices WHERE kind = 'penalty' AND month = ?1 AND abs(amount - ?2) < 0.005").bind(inv.month, inv.amount).first();
     }
   }
-  let mode = 'new';
   if (same && inv.number && !same.number) {
     await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7 WHERE id = ?1')
       .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg).run();
-    mode = 'updated';
-    id = same.id;
-  } else if (same) mode = 'duplicate';
-  else {
-    await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)')
-      .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString()).run();
+    return { inv, mode: 'updated', existing: same, id: same.id };
   }
-  const st = monthInvoices(await loadInvoices(db), inv.month);
-  const r = await send(env, chat, formatInvoiceAck(inv, st, { mode, existing: same }), { ...replyTo(docMsg), reply_markup: statsButtons(inv.month) });
-  if (mode !== 'duplicate' && r.ok) await db.prepare('UPDATE invoices SET ack_msg = ?2 WHERE id = ?1').bind(id, r.result.message_id).run();
+  if (same) return { inv, mode: 'duplicate', existing: same, id: same.id };
+  await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)')
+    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString()).run();
+  return { inv, mode: 'new', existing: null, id };
+}
+
+// Сохранить счета из файла (в пакете ТНС их несколько) и ответить одним сообщением: что принято и чего не хватает.
+async function saveInvoices(env, invs, docMsg, chat) {
+  const db = env.DB;
+  const results = [];
+  for (const inv of invs) results.push(await storeInvoice(db, inv, docMsg));
+  const all = await loadInvoices(db);
+  const statuses = new Map([...new Set(invs.map((i) => i.month))].sort().map((m) => [m, monthInvoices(all, m)]));
+  const firstMonth = [...statuses.keys()][0];
+  const r = await send(env, chat, formatInvoiceAck(results, statuses), { ...replyTo(docMsg), reply_markup: statsButtons(firstMonth) });
+  if (!r.ok) return;
+  // ответ «удалить» на это сообщение снимет все счета из файла
+  for (const x of results) if (x.mode !== 'duplicate') await db.prepare('UPDATE invoices SET ack_msg = ?2 WHERE id = ?1').bind(x.id, r.result.message_id).run();
 }
 
 // ---------- текст в канале: команды, ручной ввод, удаление ----------
@@ -124,15 +131,16 @@ async function onText(env, post) {
   const reply = post.reply_to_message;
   if (reply) {
     if (/^удал/i.test(text)) {
-      const inv = await db.prepare('SELECT * FROM invoices WHERE ack_msg = ?1').bind(reply.message_id).first();
-      if (!inv) return;
-      await db.prepare('DELETE FROM invoices WHERE id = ?1').bind(inv.id).run();
-      return send(env, post.chat.id, `🗑 Счёт удалён: ${KINDS[inv.kind]} за ${monthTitle(startOfKey(inv.month))}, ${inv.amount.toLocaleString('ru-RU')} ₽`, { ...replyTo(post.message_id), reply_markup: statsButtons(inv.month) });
+      const { results: gone } = await db.prepare('SELECT * FROM invoices WHERE ack_msg = ?1 ORDER BY month, kind').bind(reply.message_id).all();
+      if (!gone.length) return;
+      await db.prepare('DELETE FROM invoices WHERE ack_msg = ?1').bind(reply.message_id).run();
+      const what = gone.map((i) => `${KINDS[i.kind]} за ${monthTitle(startOfKey(i.month))}, ${i.amount.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽`).join('\n');
+      return send(env, post.chat.id, `🗑 ${gone.length > 1 ? 'Счета удалены:\n' : 'Счёт удалён: '}${what}`, { ...replyTo(post.message_id), reply_markup: statsButtons(gone[0].month) });
     }
     if ((reply.text ?? '').startsWith('❓')) {
       const inv = parseManual(text);
       if (!inv) return send(env, post.chat.id, 'Не понял. Пример: <code>30% октябрь 2026 13109,46</code>', replyTo(post.message_id));
-      return saveInvoice(env, inv, post.message_id, post.chat.id);
+      return saveInvoices(env, [inv], post.message_id, post.chat.id);
     }
     return;
   }
@@ -180,7 +188,7 @@ export async function retryInbox(env) {
 
 export async function parseInvoicePdf(bytes) {
   const lines = await pdfLines(bytes, inflate);
-  return { invoice: parseInvoice(lines), lines: lines.length };
+  return { invoices: parseInvoices(lines), lines: lines.length };
 }
 
 export async function postMenu(env) {
