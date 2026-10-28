@@ -26,8 +26,8 @@ function isOurChat(env, chat) {
 }
 
 async function loadInvoices(db) {
-  const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg FROM invoices').all();
-  return results;
+  const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg, meters FROM invoices').all();
+  return results.map((r) => ({ ...r, meters: r.meters ? JSON.parse(r.meters) : null }));
 }
 
 const statsButtons = (month) => ({ inline_keyboard: [[{ text: `📊 ${monthTitle(startOfKey(month))}`, callback_data: `m:${month}` }, { text: '📅 Все месяцы', callback_data: 'menu' }]] });
@@ -88,6 +88,8 @@ export async function processInbox(env, docMsg) {
 // Сохранить счёт. Аванс и окончательный бывают один раз в месяц: тот же вид за тот же месяц — это тот же счёт.
 // Если он был введён вручную, PDF дополняет запись (номер, кВт⋅ч, тариф), а не дублирует её.
 // Пеней в месяце может быть несколько: их сверяем по id, а с другими — по сумме за тот же месяц.
+const meters = (inv) => (inv.meters?.length ? JSON.stringify(inv.meters) : null);
+
 async function storeInvoice(db, inv, docMsg) {
   const id = inv.id ?? inv.number ?? `manual-${docMsg}`;
   let same;
@@ -99,13 +101,13 @@ async function storeInvoice(db, inv, docMsg) {
     }
   }
   if (same && inv.number && !same.number) {
-    await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7 WHERE id = ?1')
-      .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg).run();
+    await db.prepare('UPDATE invoices SET amount = ?2, kwh = ?3, tariff = ?4, number = ?5, issued = ?6, doc_msg = ?7, meters = ?8 WHERE id = ?1')
+      .bind(same.id, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, meters(inv)).run();
     return { inv, mode: 'updated', existing: same, id: same.id };
   }
   if (same) return { inv, mode: 'duplicate', existing: same, id: same.id };
-  await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)')
-    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString()).run();
+  await db.prepare('INSERT INTO invoices (id, month, kind, amount, kwh, tariff, number, issued, doc_msg, added, meters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)')
+    .bind(id, inv.month, inv.kind, inv.amount, inv.kwh, inv.tariff, inv.number, inv.issued, docMsg, new Date().toISOString(), meters(inv)).run();
   return { inv, mode: 'new', existing: null, id };
 }
 

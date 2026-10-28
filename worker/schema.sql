@@ -13,8 +13,10 @@ CREATE TABLE IF NOT EXISTS invoices (
   issued TEXT,                  -- дата счёта 'YYYY-MM-DD'
   doc_msg INTEGER,              -- сообщение с PDF в канале
   ack_msg INTEGER,              -- ответ бота «счёт принят»
-  added TEXT NOT NULL
+  added TEXT NOT NULL,
+  meters TEXT                   -- у окончательного: JSON [{ point, power, kwh, rub }] из ведомости — по станциям
 );
+-- для базы, созданной раньше: ALTER TABLE invoices ADD COLUMN meters TEXT;
 
 -- Очередь PDF из канала: разбор может не уложиться в лимит процессора — тогда повтор по cron
 CREATE TABLE IF NOT EXISTS inbox (

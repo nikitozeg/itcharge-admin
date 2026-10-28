@@ -37,11 +37,40 @@ export function parseInvoices(lines) {
   if (!/ТНС энерго|электроэнерги/i.test(lines.join('\n'))) return [];
   const starts = lines.flatMap((l, i) => (/^СЧЕТ(\s|$)/.test(l.trim()) ? [i] : []));
   const blocks = starts.length > 1 ? starts.map((st, k) => lines.slice(st, starts[k + 1])) : [lines];
-  return blocks.flatMap((b) => {
+  const invs = blocks.flatMap((b) => {
     // УПД и ведомость идут после последнего счёта — в его разбор не берём
     const end = b.findIndex((l) => /^(Универсальный|Ведомость электропотребления)/.test(l.trim()));
     return parseOne(end > 0 ? b.slice(0, end) : b);
   });
+  // счёт общий на обе станции; ведомость делит его по точкам учёта — кладём её к окончательному за тот же месяц
+  const sheet = parseSheet(lines);
+  const fin = sheet && invs.find((i) => i.kind === 'final' && i.month === sheet.month);
+  if (fin) fin.meters = sheet.meters;
+  return invs;
+}
+
+// Ведомость электропотребления: строка точки учёта —
+// «128000028373  47684209  31  150  1929  1981  OUT  52  60  3 120  НН  Первая  3 120  40947,17»
+// (номер точки, …, макс. мощность, показания, тип, разность, коэффициент, расход, уровень напряжения, …, объём, сумма с НДС).
+function parseSheet(lines) {
+  const at = lines.findIndex((l) => /^Ведомость электропотребления/.test(l.trim()));
+  if (at < 0) return null;
+  const rest = lines.slice(at);
+  const mm = rest.join('\n').match(/Месяц:\s*([А-Яа-яё]+)\s+(\d{4})/);
+  if (!mm || monthIndex(mm[1]) < 0) return null;
+  const meters = [];
+  for (const l of rest) {
+    const cells = l.trim().split(/\s{2,}/);
+    if (!/^\d{12}$/.test(cells[0])) continue;
+    const num = (c) => (/^-?[\d\s]+(,\d+)?$/.test(c ?? '') ? ruNum(c) : NaN);
+    const kwh = num(cells.at(-2));
+    const rub = num(cells.at(-1));
+    // мощность — за три колонки до типа показаний (OUT): «… 150  1929  1981  OUT»
+    const type = cells.findIndex((c) => /^[A-Z]{2,4}$/.test(c));
+    const power = type > 3 ? num(cells[type - 3]) : NaN;
+    if (!Number.isNaN(kwh) && !Number.isNaN(rub)) meters.push({ point: cells[0], power: Number.isNaN(power) ? null : power, kwh, rub });
+  }
+  return meters.length ? { month: keyOf(Number(mm[2]), monthIndex(mm[1])), meters } : null;
 }
 
 // Числа из строки таблицы, разбитой на колонки двойными пробелами (номер строки «1» в начале — не число таблицы).
@@ -131,7 +160,7 @@ const monthCharge = (inv) => (inv?.kind === 'final' && inv.kwh && inv.tariff ? r
 const STATE_ICON = { ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' };
 const invoiceSummary = (inv) => {
   const charge = monthCharge(inv);
-  if (charge != null) return `к оплате ${nf2.format(inv.amount)} ₽ · за месяц начислено ${nf2.format(charge)} ₽ за ${nf2.format(inv.kwh)} кВт⋅ч по счётчику`;
+  if (charge != null) return `к оплате ${nf2.format(inv.amount)} ₽ · за месяц начислено ${nf2.format(charge)} ₽ за ${nf2.format(inv.kwh)} кВт⋅ч по счётчикам обеих станций`;
   return `${nf2.format(inv.amount)} ₽${inv.kwh != null ? ` · ${nf2.format(inv.kwh)} кВт⋅ч` : ''}`;
 };
 const updatedNote = ({ mode, existing, inv }) => (mode !== 'updated' ? ''
@@ -244,10 +273,6 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
 
   // прибыль: электричество по счетам, если они есть; иначе — оценка по отпущенным кВт⋅ч
   const fin = st.items.find((i) => i.kind === 'final').inv;
-  if (monthCharge(fin) != null && kwh > 0) {
-    const diff = fin.kwh - kwh;
-    lines.push(`🔌 По счётчику ${nf0.format(fin.kwh)} кВт⋅ч, машинам отпущено ${nf0.format(kwh)} — разница ${nf0.format(diff)} кВт⋅ч (${nf0.format((diff / fin.kwh) * 100)}%)`);
-  }
   const tariffInv = st.items.find((i) => i.inv?.tariff)?.inv;
   const tariffVat = tariffInv ? tariffInv.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT;
   const billed = st.items.reduce((a, i) => a + (i.inv?.amount ?? 0), 0);
@@ -256,13 +281,35 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   const exact = charge != null || st.complete;
   const electricity = charge ?? (st.complete ? billed : kwh * tariffVat);
   const fee = rub * IT_CHARGE_FEE;
+
+  // счёт общий на обе станции; ведомость делит его по счётчикам — станцию узнаём по мощности (DC150 → 150, АС22 → 22)
+  const perStation = [];
+  const meters = typeof fin?.meters === 'string' ? JSON.parse(fin.meters) : fin?.meters; // из D1 приходит строкой
+  if (meters?.length) {
+    lines.push('🔌 Счёт общий на обе станции, по счётчикам:');
+    for (const m of meters) {
+      const name = [...byStation.keys()].find((n) => m.power != null && shortStation(n ?? '').replace(/\D/g, '') === String(m.power));
+      const a = byStation.get(name) ?? { rub: 0, kwh: 0 };
+      const label = name ? esc(shortStation(name)) : m.power != null ? `станция ${nf0.format(m.power)} кВт` : `точка ${m.point}`;
+      const loss = m.kwh > 0 ? ` (разница ${nf0.format(((m.kwh - a.kwh) / m.kwh) * 100)}%)` : '';
+      lines.push(`• ${label} — ${nf0.format(m.kwh)} кВт⋅ч на ${nf0.format(m.rub)} ₽ · машинам ${nf0.format(a.kwh)}${loss}`);
+      perStation.push({ label, profit: a.rub - m.rub - a.rub * IT_CHARGE_FEE });
+    }
+  } else if (charge != null && kwh > 0) {
+    const diff = fin.kwh - kwh;
+    lines.push(`🔌 По счётчикам обеих станций ${nf0.format(fin.kwh)} кВт⋅ч, машинам отпущено ${nf0.format(kwh)} — разница ${nf0.format(diff)} кВт⋅ч (${nf0.format((diff / fin.kwh) * 100)}%)`);
+  }
+
   const fixed = FIXED_MONTH * Math.min(1, Math.max(0, (Math.min(now, mEnd) - mStart) / (mEnd - mStart)));
   const profit = rub - electricity - fee - fixed - pen;
   lines.push('', '🧮 <b>Прибыль</b>');
   lines.push(`выручка ${nf0.format(rub)} − электричество ${exact ? '' : '≈ '}${nf0.format(electricity)} − комиссия IT Charge ${nf0.format(fee)} − ИП и связь ${nf0.format(fixed)}${pen ? ` − пени ${nf0.format(pen)}` : ''}`);
   lines.push(`= <b>${exact ? '' : '≈ '}${nf0.format(profit)} ₽</b>`);
+  if (perStation.length > 1) {
+    lines.push(`по станциям (выручка − свет − комиссия): ${perStation.map((x) => `${x.label} ${x.profit < 0 ? '−' : ''}${nf0.format(Math.abs(x.profit))} ₽`).join(' · ')}`);
+  }
   if (!exact) {
-    lines.push(`<i>электричество оценено по отпущенным кВт⋅ч × ${nf2.format(tariffVat)} ₽${billed ? `; по счетам уже ${nf0.format(billed)} ₽` : ''}</i>`);
+    lines.push(`<i>электричество оценено по отпущенным кВт⋅ч обеих станций × ${nf2.format(tariffVat)} ₽${billed ? `; по счетам уже ${nf0.format(billed)} ₽` : ''}</i>`);
   }
   if (st.missing.length) lines.push('', `⚠️ <b>Не хватает:</b> ${missingText(st)}`);
   return lines.join('\n');
