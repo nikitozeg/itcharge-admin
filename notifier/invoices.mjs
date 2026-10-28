@@ -179,6 +179,17 @@ export function electricityPerKwh(invoices, monthKwh = {}) {
   return { perKwh: last ? last.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT, months: [] };
 }
 
+// Тариф ТНС за месяц, ₽/кВт⋅ч без НДС: из окончательного счёта, иначе — из авансов того же пакета
+// (40% на следующий месяц и 30% через месяц ТНС считает по цене только что закрытого месяца); null — неизвестен.
+export function monthTariff(invoices, key) {
+  const s = startOfKey(key);
+  const next = monthKey(monthStart(s, 1));
+  const after = monthKey(monthStart(s, 2));
+  const inv = invoices.find((i) => i.tariff && i.kind === 'final' && i.month === key)
+    ?? invoices.find((i) => i.tariff && ((i.kind === 'adv40' && i.month === next) || (i.kind === 'adv30' && i.month === after)));
+  return inv?.tariff ?? null;
+}
+
 const STATE_ICON = { ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' };
 const invoiceSummary = (inv) => {
   const charge = monthCharge(inv);
@@ -295,8 +306,9 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
 
   // прибыль: электричество по счетам, если они есть; иначе — оценка по отпущенным кВт⋅ч
   const fin = st.items.find((i) => i.kind === 'final').inv;
-  const tariffInv = st.items.find((i) => i.inv?.tariff)?.inv;
-  const tariffVat = tariffInv ? tariffInv.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT;
+  const tariff = monthTariff(invoices, key);
+  const tariffInv = st.items.find((i) => i.inv?.tariff)?.inv; // авансы месяца — по цене одного из прошлых месяцев
+  const tariffVat = tariff ? tariff * (1 + VAT) : tariffInv ? tariffInv.tariff * (1 + VAT) : DEFAULT_TARIFF_VAT;
   // точнее всего — окончательный счёт из PDF (весь месяц по счётчику), потом полный комплект счетов, иначе оценка
   const charge = monthCharge(fin);
   const billed = st.items.reduce((a, i) => a + (i.inv?.amount ?? 0), 0);
@@ -321,6 +333,18 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   } else if (charge != null && kwh > 0) {
     const diff = fin.kwh - kwh;
     lines.push(`🔌 По счётчикам обеих станций ${nf0.format(fin.kwh)} кВт⋅ч, машинам отпущено ${nf0.format(kwh)} — разница ${nf0.format(diff)} кВт⋅ч (${nf0.format((diff / fin.kwh) * 100)}%)`);
+  }
+
+  // цена кВт⋅ч: тариф ТНС и во что обошёлся кВт⋅ч, отданный машинам (счёт с НДС ÷ отпущено — сюда входят потери станции)
+  const perDelivered = exact && kwh > 0 ? electricity / kwh : null;
+  if (tariff || perDelivered) {
+    const parts = [tariff ? `тариф ТНС ${nf2.format(tariff * (1 + VAT))} ₽/кВт⋅ч с НДС` : 'тариф ТНС неизвестен — он в PDF окончательного счёта'];
+    if (perDelivered) {
+      const d = tariff ? (perDelivered / (tariff * (1 + VAT)) - 1) * 100 : null;
+      const vs = d == null ? '' : d >= 0.5 ? ` (+${nf0.format(d)}% к тарифу: потери станции)` : d <= -0.5 ? ` (−${nf0.format(-d)}% к тарифу)` : '';
+      parts.push(`кВт⋅ч машинам обошёлся в <b>${nf2.format(perDelivered)} ₽</b>${vs}`);
+    }
+    lines.push(`💡 Свет: ${parts.join(' · ')}`);
   }
 
   const fixed = FIXED_MONTH * Math.min(1, Math.max(0, (Math.min(now, mEnd) - mStart) / (mEnd - mStart)));
