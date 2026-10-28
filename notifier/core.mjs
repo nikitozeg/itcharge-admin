@@ -103,6 +103,14 @@ export function parallelInfo(t, rows, now = Date.now()) {
   return { cars: overlaps.length, peak, minutes: total / 60e3, of: t.totalDuration ?? (stop - start) / 60e3 };
 }
 
+// Чистыми — выручка минус комиссия IT Charge и свет; ИП и связь считаются только в месячной статистике.
+const netOf = (rub, kwh, perKwh) => rub - rub * IT_CHARGE_FEE - kwh * perKwh;
+const signed = (x) => `${x < -0.5 ? '−' : ''}${nf0.format(Math.abs(x))}`;
+const netLine = (rub, kwh, perKwh) => {
+  const fee = rub * IT_CHARGE_FEE;
+  return `🧮 Чистыми ≈ <b>${signed(netOf(rub, kwh, perKwh))} ₽</b> · свет −${nf0.format(kwh * perKwh)} ₽ (${nf2.format(perKwh)} ₽/кВт⋅ч)${fee >= 0.5 ? ` · IT Charge −${nf0.format(fee)} ₽` : ''}`;
+};
+
 // Текст сообщения (HTML-разметка Telegram). Данных клиента в нём нет.
 // costs.perKwh — сколько стоит свет на 1 кВт⋅ч, отпущенный машине (по счетам ТНС, с НДС и потерями станции).
 export function formatMessage(t, { test = false, parallel = null, costs = null } = {}) {
@@ -131,13 +139,7 @@ export function formatMessage(t, { test = false, parallel = null, costs = null }
   lines.push(`🔋 <b>${nf2.format(kwh)} кВт⋅ч</b>${battery}`);
 
   if (rub || perKwh) lines.push(`💰 <b>${nf2.format(rub)} ₽</b>${perKwh ? ` · ${nf2.format(perKwh)} ₽/кВт⋅ч` : ''}`);
-  // чистыми — выручка минус комиссия IT Charge и свет; ИП и связь считаются только в месячной статистике
-  if (costs?.perKwh > 0 && kwh > 0) {
-    const light = kwh * costs.perKwh;
-    const fee = rub * IT_CHARGE_FEE;
-    const net = rub - fee - light;
-    lines.push(`🧮 Чистыми ≈ <b>${net < -0.5 ? '−' : ''}${nf0.format(Math.abs(net))} ₽</b> · свет −${nf0.format(light)} ₽ (${nf2.format(costs.perKwh)} ₽/кВт⋅ч)${fee >= 0.5 ? ` · IT Charge −${nf0.format(fee)} ₽` : ''}`);
-  }
+  if (costs?.perKwh > 0 && kwh > 0) lines.push(netLine(rub, kwh, costs.perKwh));
 
   if (start) {
     const when = `${dateFmt.format(start)}, ${timeFmt.format(start)}${stop ? `–${timeFmt.format(stop)}` : ''}`;
@@ -292,7 +294,7 @@ export function formatMonthly(rows, start, end, prev = [], { test = false } = {}
   return lines.join('\n');
 }
 
-export function formatDaily(rows, start, end) {
+export function formatDaily(rows, start, end, { costs = null } = {}) {
   const byStation = new Map();
   for (const r of rows) {
     const stop = Date.parse(r.stoppedTimestamp ?? '');
@@ -313,10 +315,12 @@ export function formatDaily(rows, start, end) {
     return lines.join('\n');
   }
   lines.push(`💰 <b>${nf2.format(total.rub)} ₽</b> · ${total.count} ${plural(total.count, 'зарядка', 'зарядки', 'зарядок')} · ${nf0.format(total.kwh)} кВт⋅ч`);
+  const perKwh = costs?.perKwh > 0 ? costs.perKwh : null;
+  if (perKwh) lines.push(netLine(total.rub, total.kwh, perKwh));
   lines.push(`💳 кончился баланс: ${total.balance} из ${total.count}${total.balance ? ` (${Math.round((total.balance / total.count) * 100)}%)` : ''}`);
   const stations = [...byStation.entries()].filter(([, s]) => s.count).sort((a, b) => b[1].rub - a[1].rub);
   if (stations.length > 1) {
-    for (const [name, s] of stations) lines.push(`• ${esc(name)} — ${nf2.format(s.rub)} ₽ · ${s.count} · ${nf0.format(s.kwh)} кВт⋅ч`);
+    for (const [name, s] of stations) lines.push(`• ${esc(name)} — ${nf2.format(s.rub)} ₽ · ${s.count} · ${nf0.format(s.kwh)} кВт⋅ч${perKwh ? ` · чистыми ≈ ${signed(netOf(s.rub, s.kwh, perKwh))} ₽` : ''}`);
   }
   return lines.join('\n');
 }
@@ -760,7 +764,8 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   if (!state.lastDaily) state.lastDaily = key;
   else if (state.lastDaily < key && now - end >= 60e3) {
     const txs = await withToken((t) => transactionsSince(t, end - 2 * DAY));
-    queue.push({ text: formatDaily(txs, end - DAY, end), apply: () => (state.lastDaily = key) });
+    await loadCosts();
+    queue.push({ text: formatDaily(txs, end - DAY, end, { costs }), apply: () => (state.lastDaily = key) });
     daily = true;
   }
 
