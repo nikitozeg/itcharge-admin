@@ -1,7 +1,7 @@
 // Обновления Telegram (вебхук): счета ТНС энерго в канале и кнопки статистики по месяцам.
 import { normalizeChatId, tgCall, itchargeClient, monthData, monthTitle } from '../notifier/core.mjs';
 import { pdfLines } from '../notifier/pdf.mjs';
-import { parseInvoices, parseAct, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, electricityPerKwh, MENU_TEXT, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
+import { parseInvoices, parseAct, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, electricityPerKwh, menuText, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
 
 const MAX_ATTEMPTS = 3;
@@ -173,7 +173,7 @@ async function onText(env, post) {
     return;
   }
   if (/^\/?(stats|menu|статистика|итоги|месяцы|счета)\b/i.test(text)) {
-    await send(env, post.chat.id, MENU_TEXT, { reply_markup: monthsKeyboard(await loadInvoices(db)) });
+    await send(env, post.chat.id, menuText(), { reply_markup: monthsKeyboard(await loadInvoices(db)) });
     await tg(env, 'deleteMessage', { chat_id: post.chat.id, message_id: post.message_id }); // если у бота есть право удалять
   }
 }
@@ -188,8 +188,8 @@ async function onCallback(env, cb) {
     await tg(env, 'answerCallbackQuery', { callback_query_id: cb.id });
     const kb = monthsKeyboard(await loadInvoices(db));
     // меню и статистику листаем в одном сообщении; из ответа на счёт — новым сообщением
-    if (/^(📅|📊)/.test(msg.text ?? '')) return tg(env, 'editMessageText', { chat_id: msg.chat.id, message_id: msg.message_id, text: MENU_TEXT, parse_mode: 'HTML', reply_markup: kb });
-    return send(env, msg.chat.id, MENU_TEXT, { reply_markup: kb });
+    if (/^(📅|📊)/.test(msg.text ?? '')) return tg(env, 'editMessageText', { chat_id: msg.chat.id, message_id: msg.message_id, text: menuText(), parse_mode: 'HTML', reply_markup: kb });
+    return send(env, msg.chat.id, menuText(), { reply_markup: kb });
   }
   const m = data.match(/^m:(\d{4}-\d{2})$/);
   if (!m) return tg(env, 'answerCallbackQuery', { callback_query_id: cb.id });
@@ -223,7 +223,7 @@ export async function parseInvoicePdf(bytes) {
 }
 
 export async function postMenu(env) {
-  return send(env, normalizeChatId(env.TELEGRAM_CHAT_ID), MENU_TEXT, { reply_markup: monthsKeyboard(await loadInvoices(env.DB)) });
+  return send(env, normalizeChatId(env.TELEGRAM_CHAT_ID), menuText(), { reply_markup: monthsKeyboard(await loadInvoices(env.DB)) });
 }
 
 export async function setWebhook(env, origin) {

@@ -283,7 +283,18 @@ export function monthsKeyboard(invoices, now = Date.now()) {
   return { inline_keyboard: rows };
 }
 
-export const MENU_TEXT = '📅 <b>Статистика по месяцам</b>\nНажми месяц — покажу выручку, зарядки, счета ТНС энерго и прибыль.\n✅ — все счета на месте · ⚠️ — какого-то счёта не хватает';
+const MENU_TEXT = '📅 <b>Статистика по месяцам</b>\nНажми месяц — покажу выручку, зарядки, счета ТНС энерго и прибыль.\n✅ — все счета на месте · ⚠️ — какого-то счёта не хватает';
+
+// Напоминания под кнопками месяцев. Декларация УСН — каждый год сама; сумма взносов 1% у каждого года своя — следующую дописать сюда.
+const TAX_DUES = [{ text: '1% взносов за 2026 год (37 000 ₽)', due: Date.UTC(2027, 6, 1) - MSK }];
+const declaration = (year) => ({ text: `Декларация УСН за ${year - 1} год`, due: Date.UTC(year, 3, 25) - MSK });
+
+export function menuText(now = Date.now()) {
+  const open = (r) => now < r.due + 86400e3; // срок держим до конца его дня
+  const year = new Date(now + MSK).getUTCFullYear();
+  const dues = [[declaration(year), declaration(year + 1)].find(open), ...TAX_DUES.filter(open)].sort((a, b) => a.due - b.due);
+  return [MENU_TEXT, '', '🔔 <b>Напоминания</b>', ...dues.map((r) => `• ${r.text} — до ${dateRu(r.due)}`)].join('\n');
+}
 
 // Полная статистика месяца: зарядки из IT Charge + счета ТНС + прибыль.
 // costs — electricityPerKwh(…): им оцениваем свет, пока окончательного счёта нет.
