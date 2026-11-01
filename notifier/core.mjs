@@ -21,6 +21,9 @@ const INITIATORS = { CUSTOMER: 'клиент', CHARGING_STATION: 'станция
 const FAIL_GRACE_MIN = 5;
 const FAIL_REPEAT_MIN = 20; // вторая неудачная попытка в пределах 20 мин — сразу тревога с телефоном
 const FAIL_FOLLOW_MIN = 60; // столько ждём, что клиент всё же зарядится, чтобы ответить ✅
+// Клиент только что нормально зарядился — следующие отмены не тревога: случайно нажал или машина уже не берёт ток.
+const AFTER_CHARGE_MIN = 60;
+const AFTER_CHARGE_KWH = 5; // зарядка меньше этого могла оборваться в начале — такой клиент и правда может не суметь продолжить
 const STOP_REASONS = {
   EVDISCONNECTED: 'связь с машиной разорвана', REMOTE: 'остановлено из приложения', LOCAL: 'остановлено кнопкой на станции',
   OTHER: 'другая причина', TIMEOUT: 'машина не ответила вовремя', DEAUTHORIZED: 'авторизация отклонена', EMERGENCYSTOP: 'аварийная кнопка', POWERLOSS: 'пропало питание',
@@ -339,7 +342,8 @@ const whoKey = (r) => `${r.chargingStation?.id ?? r.chargingStation?.name}|${r.a
 //  • вторая попытка серии — сразу тревога с телефоном клиента (или ответ с телефоном
 //    на уже отправленную тревогу);
 //  • одна попытка — тревога, если за FAIL_GRACE_MIN клиент так и не начал заряжаться;
-//  • зарядился в пределах FAIL_GRACE_MIN — молчим; позже — отвечаем ✅ (ждём FAIL_FOLLOW_MIN).
+//  • зарядился в пределах FAIL_GRACE_MIN — молчим; позже — отвечаем ✅ (ждём FAIL_FOLLOW_MIN);
+//  • первая попытка серии в пределах AFTER_CHARGE_MIN после нормальной зарядки этого клиента — молчим.
 // Возвращает alerts и follows; apply() меняет состояние только после успешной отправки.
 export function failureUpdates(rows, state, now = Date.now()) {
   const fails = rows.filter(isFail).sort((a, b) => tStart(a) - tStart(b));
@@ -353,6 +357,8 @@ export function failureUpdates(rows, state, now = Date.now()) {
   const seen = new Set(state.failSeen);
   const charges = rows.filter(isCharge).sort((a, b) => tStart(a) - tStart(b));
   const successAfter = (key, t) => charges.find((c) => whoKey(c) === key && tStart(c) >= t - 60e3);
+  const justCharged = (key, t) => charges.some((c) => c.transactionStep === 'FINISHED_SUCCESS' && c.totalKW >= AFTER_CHARGE_KWH
+    && whoKey(c) === key && tStart(c) <= t && t - tStop(c) <= AFTER_CHARGE_MIN * 60e3);
   const customerOf = (r) => r.authorization?.customer?.id ?? null;
   const repeatMs = FAIL_REPEAT_MIN * 60e3;
 
@@ -401,7 +407,8 @@ export function failureUpdates(rows, state, now = Date.now()) {
       const markSeen = () => state.failSeen.push(...s.map((r) => r.id));
       const base = { kind: 'new', key, series: s, t0, customerId: customerOf(s[0]), txId: s[s.length - 1].id };
       const openSeries = (msgId, phoneSent) => (state.failOpen[s[0].id] = { key, t0, attempts: s.length, lastFailAt: tStop(s[s.length - 1]), alertedAt: now, msgId: msgId ?? null, phoneSent });
-      if (ok && tStart(ok) - t0 <= FAIL_GRACE_MIN * 60e3) markSeen(); // быстро получилось — не тревожим
+      if (justCharged(key, t0)) markSeen();
+      else if (ok && tStart(ok) - t0 <= FAIL_GRACE_MIN * 60e3) markSeen(); // быстро получилось — не тревожим
       else if (ok) alerts.push({ ...base, ok, apply: markSeen }); // уже зарядился, но не сразу — просто сообщаем
       else if (s.length >= 2) alerts.push({ ...base, needPhone: true, apply: (msgId) => { markSeen(); openSeries(msgId, true); } });
       else if (now - t0 >= FAIL_GRACE_MIN * 60e3) alerts.push({ ...base, apply: (msgId) => { markSeen(); openSeries(msgId, false); } });
