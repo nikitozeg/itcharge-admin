@@ -342,12 +342,13 @@ const lastDataAt = (r) => Math.max(Date.parse(r.updatedAt ?? '') || 0, tStart(r)
 // known — те из зависших, что ушли из последних транзакций (запрошены отдельно). apply() — после отправки.
 export function stuckUpdates(rows, stations, state, now = Date.now(), known = []) {
   state.stuck ??= {};
-  const online = new Set(stations.filter((st) => st.connected && !st.archived).map((st) => st.id));
+  // станция на связи → с какого момента; после обрыва связи она досылает данные не сразу — тишину считаем от возврата
+  const online = new Map(stations.filter((st) => st.connected && !st.archived).map((st) => [st.id, Date.parse(st.lastConnectionStatusChangedAt ?? '') || 0]));
   const alerts = [];
   for (const r of rows) {
     if (!ACTIVE.has(r.transactionStep) || state.stuck[r.id] || !online.has(r.chargingStation?.id)) continue;
     const since = lastDataAt(r);
-    if (now - since < STUCK_MIN * 60e3) continue;
+    if (now - Math.max(since, online.get(r.chargingStation.id)) < STUCK_MIN * 60e3) continue;
     // машины, заряжавшиеся на этом разъёме после последних данных, — значит, висит только запись в IT Charge
     const later = rows.filter((o) => o.id !== r.id && o.totalKW > 0 && o.chargingStation?.id === r.chargingStation?.id && o.connector?.id === r.connector?.id && tStart(o) > since).length;
     alerts.push({ text: formatStuck(r, { since, later, now }), apply: (msgId) => (state.stuck[r.id] = { msgId: msgId ?? null, seqNo: r.seqNo, at: now }) });
