@@ -24,6 +24,10 @@ const FAIL_FOLLOW_MIN = 60; // столько ждём, что клиент вс
 // Клиент только что нормально зарядился — следующие отмены не тревога: случайно нажал или машина уже не берёт ток.
 const AFTER_CHARGE_MIN = 60;
 const AFTER_CHARGE_KWH = 5; // зарядка меньше этого могла оборваться в начале — такой клиент и правда может не суметь продолжить
+// Зависшая сессия: открыта, станция на связи, а данных по ней нет столько минут (у живой сессии длительность растёт постоянно).
+const STUCK_MIN = 30;
+const STUCK_KEEP_DAYS = 7; // столько ждём, что зависшую закроют, чтобы ответить ✅
+const ACTIVE = new Set(['CHARGING', 'CABLE_PLUGGED_IN', 'WAITING_FOR_CABLE_INSERT', 'OFFLINE']);
 const STOP_REASONS = {
   EVDISCONNECTED: 'связь с машиной разорвана', REMOTE: 'остановлено из приложения', LOCAL: 'остановлено кнопкой на станции',
   OTHER: 'другая причина', TIMEOUT: 'машина не ответила вовремя', DEAUTHORIZED: 'авторизация отклонена', EMERGENCYSTOP: 'аварийная кнопка', POWERLOSS: 'пропало питание',
@@ -54,7 +58,7 @@ const plural = (n, one, few, many) => {
 };
 
 export const TX_FIELDS = `
-  seqNo id transactionStep startedTimestamp stoppedTimestamp totalKW avgPower maxPower
+  seqNo id transactionStep startedTimestamp stoppedTimestamp updatedAt totalKW avgPower maxPower
   totalDuration idleDuration startedPercentage percentage stopInitiator stoppedReason chargingState
   tariff { type amount name }
   connector { id evseId type }
@@ -326,6 +330,62 @@ export function formatDaily(rows, start, end, { costs = null } = {}) {
     for (const [name, s] of stations) lines.push(`• ${esc(name)} — ${nf2.format(s.rub)} ₽ · ${s.count} · ${nf0.format(s.kwh)} кВт⋅ч${perKwh ? ` · чистыми ≈ ${signed(netOf(s.rub, s.kwh, perKwh))} ₽` : ''}`);
   }
   return lines.join('\n');
+}
+
+// ---------- зависшие сессии ----------
+
+// Последние данные по сессии: последнее обновление записи или конец учтённой длительности.
+const lastDataAt = (r) => Math.max(Date.parse(r.updatedAt ?? '') || 0, tStart(r) + (r.totalDuration ?? 0) * 60e3);
+
+// Сессия висит открытой, хотя станция на связи: станция не сообщила о конце зарядки. Пока её не закроют
+// в панели IT Charge, зарядки нет в выручке и итогах. Станция без связи — не сюда: о ней своя тревога.
+// known — те из зависших, что ушли из последних транзакций (запрошены отдельно). apply() — после отправки.
+export function stuckUpdates(rows, stations, state, now = Date.now(), known = []) {
+  state.stuck ??= {};
+  const online = new Set(stations.filter((st) => st.connected && !st.archived).map((st) => st.id));
+  const alerts = [];
+  for (const r of rows) {
+    if (!ACTIVE.has(r.transactionStep) || state.stuck[r.id] || !online.has(r.chargingStation?.id)) continue;
+    const since = lastDataAt(r);
+    if (now - since < STUCK_MIN * 60e3) continue;
+    // машины, заряжавшиеся на этом разъёме после последних данных, — значит, висит только запись в IT Charge
+    const later = rows.filter((o) => o.id !== r.id && o.totalKW > 0 && o.chargingStation?.id === r.chargingStation?.id && o.connector?.id === r.connector?.id && tStart(o) > since).length;
+    alerts.push({ text: formatStuck(r, { since, later, now }), apply: (msgId) => (state.stuck[r.id] = { msgId: msgId ?? null, seqNo: r.seqNo, at: now }) });
+  }
+  const follows = [];
+  for (const [id, o] of Object.entries(state.stuck)) {
+    const r = rows.find((x) => x.id === id) ?? known.find((x) => x.id === id);
+    if (r && FINISHED.has(r.transactionStep)) follows.push({ text: formatStuckClosed(r, o), replyTo: o.msgId, apply: () => delete state.stuck[id] });
+    else if (now - o.at > STUCK_KEEP_DAYS * DAY) follows.push({ silent: true, apply: () => delete state.stuck[id] });
+  }
+  return { alerts, follows };
+}
+
+export function formatStuck(r, { since, later = 0, now = Date.now() }) {
+  const conn = CONNECTORS[r.connector?.type] ?? r.connector?.type?.replace(/^C_/, '').replace(/_/g, ' ') ?? '';
+  const rub = r.invoice?.amount ?? r.payment?.amount ?? 0;
+  const battery = r.startedPercentage != null && r.percentage != null ? ` · батарея ${r.startedPercentage}% → ${r.percentage}%` : '';
+  const lines = [
+    `⏸ <b>Сессия зависла</b> — станция на связи, а по сессии нет данных уже ${fmtDuration((now - since) / 60e3)}`,
+    `🔌 <b>${esc(conn || 'Разъём')}</b>${r.connector?.id != null ? ` · разъём ${r.connector.id}` : ''} · ${esc(shortStation(r.chargingStation?.name))}`,
+    `⏱ началась ${fmtWhen(new Date(tStart(r)))} · последние данные ${fmtWhen(new Date(since))}`,
+    `🔋 ${nf2.format(r.totalKW ?? 0)} кВт⋅ч${battery}${rub ? ` · ${nf2.format(rub)} ₽` : ''}`,
+  ];
+  if (later) lines.push(`🔁 на этом разъёме с тех пор зарядились ещё ${later} ${plural(later, 'машина', 'машины', 'машин')} — висит только запись в IT Charge`);
+  lines.push('👉 Закройте сессию в панели IT Charge: пока она открыта, зарядки нет в выручке и итогах');
+  if (r.authorization?.customer?.seqNo != null) lines.push(`👤 клиент №${r.authorization.customer.seqNo}`);
+  lines.push(`🧾 транзакция №${r.seqNo}`);
+  return lines.join('\n');
+}
+
+function formatStuckClosed(r, o) {
+  const rub = r.invoice?.amount ?? r.payment?.amount ?? 0;
+  return `✅ Сессия №${r.seqNo ?? o.seqNo} закрыта${r.totalKW ? ` · ${nf2.format(r.totalKW)} кВт⋅ч` : ''}${rub ? ` · ${nf2.format(rub)} ₽` : ''}`;
+}
+
+async function transactionById(token, id) {
+  const data = await gql(`query($id: FilterUuid) { TransactionsList(id: $id, page: { size: 1, number: 1 }) { rows { ${TX_FIELDS} } } }`, { id: { eq: id } }, token);
+  return data.TransactionsList.rows[0] ?? null;
 }
 
 // ---------- неудачные попытки зарядки ----------
@@ -756,9 +816,17 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   }
   const followMsgs = fail.follows.filter((x) => !x.silent);
 
+  // Зависшие сессии: тревога один раз, ✅ ответом, когда её закроют. Ушедшие из последних транзакций запрашиваем по id.
+  const gone = Object.keys(state.stuck ?? {}).filter((id) => !rows.some((r) => r.id === id));
+  const known = gone.length ? (await Promise.all(gone.map((id) => withToken((t) => transactionById(t, id)).catch(() => null)))).filter(Boolean) : [];
+  const stuck = stuckUpdates(rows, stations, state, now, known);
+  for (const f of stuck.follows.filter((x) => x.silent)) f.apply();
+  const stuckMsgs = [...stuck.alerts, ...stuck.follows.filter((x) => !x.silent)];
+
   if (charges.length) await loadCosts();
   const queue = [
     ...stationMsgs,
+    ...stuckMsgs,
     ...failMsgs,
     ...followMsgs,
     ...charges.map((t) => ({ text: formatMessage(t, { parallel: parallelInfo(t, rows, now), costs }), apply: () => state.notified.push(t.id) })),
@@ -800,6 +868,6 @@ export async function check({ secrets, state, token, test = false, monthlyTest =
   }
   state.notified = state.notified.slice(-KEEP_IDS);
   if (state.failSeen) state.failSeen = state.failSeen.slice(-KEEP_IDS);
-  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, месячный итог: ${monthly ? 'да' : 'нет'}, опубликовано: ${sent}`);
+  log.push(`новых зарядок: ${charges.length}, событий связи: ${stationMsgs.length}, неудачных попыток: ${failMsgs.length} (+${followMsgs.length} ✅), зависших сессий: ${stuck.alerts.length} (+${stuckMsgs.length - stuck.alerts.length} ✅), суточный итог: ${daily ? 'да' : 'нет'}, месячный итог: ${monthly ? 'да' : 'нет'}, опубликовано: ${sent}`);
   return { state, token: client.token(), log: log.join('; '), error };
 }
