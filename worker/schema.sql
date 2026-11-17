@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS invoices (
 );
 -- для базы, созданной раньше: ALTER TABLE invoices ADD COLUMN meters TEXT; ALTER TABLE invoices ADD COLUMN accrued REAL;
 
+-- PDF счетов в канале: какие счета (месяц, вид) в каждом — для кнопок на документы в карточке месяца
+CREATE TABLE IF NOT EXISTS docs (
+  doc_msg INTEGER PRIMARY KEY,  -- сообщение с PDF в канале
+  file_name TEXT,
+  invoices TEXT NOT NULL,       -- JSON [{ month, kind }]
+  added TEXT NOT NULL
+);
+
 -- Очередь PDF из канала: разбор может не уложиться в лимит процессора — тогда повтор по cron
 CREATE TABLE IF NOT EXISTS inbox (
   doc_msg INTEGER PRIMARY KEY,

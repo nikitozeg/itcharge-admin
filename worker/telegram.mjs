@@ -1,7 +1,7 @@
 // Обновления Telegram (вебхук): счета ТНС энерго в канале и кнопки статистики по месяцам.
 import { normalizeChatId, tgCall, itchargeClient, monthData, monthTitle } from '../notifier/core.mjs';
 import { pdfLines } from '../notifier/pdf.mjs';
-import { parseInvoices, parseAct, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, electricityPerKwh, menuText, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
+import { parseInvoices, parseAct, parseManual, monthInvoices, formatInvoiceAck, formatMonthStats, monthsKeyboard, electricityPerKwh, docButtons, menuText, UNRECOGNIZED, KINDS } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
 
 const MAX_ATTEMPTS = 3;
@@ -29,6 +29,12 @@ export async function loadInvoices(db) {
   const { results } = await db.prepare('SELECT id, month, kind, amount, kwh, tariff, number, issued, doc_msg, ack_msg, meters, accrued FROM invoices').all();
   return results.map((r) => ({ ...r, meters: r.meters ? JSON.parse(r.meters) : null }));
 }
+
+// Ссылка на сообщение канала: закрытый — t.me/c/<id без -100>/<сообщение>, публичный — t.me/<имя>/<сообщение>.
+const msgLink = (env, msgId) => {
+  const id = normalizeChatId(env.TELEGRAM_CHAT_ID);
+  return id.startsWith('@') ? `https://t.me/${id.slice(1)}/${msgId}` : `https://t.me/c/${id.replace(/^-100/, '')}/${msgId}`;
+};
 
 const statsButtons = (month) => ({ inline_keyboard: [[{ text: `📊 ${monthTitle(startOfKey(month))}`, callback_data: `m:${month}` }, { text: '📅 Все месяцы', callback_data: 'menu' }]] });
 
@@ -84,7 +90,7 @@ export async function processInbox(env, docMsg) {
     await send(env, row.chat_id, UNRECOGNIZED, replyTo(docMsg));
     return done();
   }
-  await saveInvoices(env, invs, docMsg, row.chat_id, act);
+  await saveInvoices(env, invs, docMsg, row.chat_id, { act, fileName: row.file_name, pdf: true });
   await done();
 }
 
@@ -135,10 +141,15 @@ export async function applyAct(db, act) {
 }
 
 // Сохранить счета из файла (в пакете ТНС их несколько) и ответить одним сообщением: что принято и чего не хватает.
-async function saveInvoices(env, invs, docMsg, chat, act = []) {
+// pdf — счета пришли файлом: запоминаем его, чтобы в карточках месяцев были кнопки на этот PDF (и для дублей тоже).
+async function saveInvoices(env, invs, docMsg, chat, { act = [], fileName = null, pdf = false } = {}) {
   const db = env.DB;
   const results = [];
   for (const inv of invs) results.push(await storeInvoice(db, inv, docMsg));
+  if (pdf) {
+    await db.prepare('INSERT OR REPLACE INTO docs (doc_msg, file_name, invoices, added) VALUES (?1, ?2, ?3, ?4)')
+      .bind(docMsg, fileName, JSON.stringify(invs.map((i) => ({ month: i.month, kind: i.kind }))), new Date().toISOString()).run();
+  }
   // начисления окончательных из самого пакета не трогаем — акт уточняет только остальные месяцы
   const own = new Set(invs.filter((i) => i.kind === 'final').map((i) => i.month));
   const actMonths = await applyAct(db, act.filter((a) => !own.has(a.month)));
@@ -162,6 +173,7 @@ async function onText(env, post) {
       const { results: gone } = await db.prepare('SELECT * FROM invoices WHERE ack_msg = ?1 ORDER BY month, kind').bind(reply.message_id).all();
       if (!gone.length) return;
       await db.prepare('DELETE FROM invoices WHERE ack_msg = ?1').bind(reply.message_id).run();
+      for (const d of new Set(gone.map((i) => i.doc_msg).filter(Boolean))) await db.prepare('DELETE FROM docs WHERE doc_msg = ?1').bind(d).run();
       const what = gone.map((i) => `${KINDS[i.kind]} за ${monthTitle(startOfKey(i.month))}, ${i.amount.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽`).join('\n');
       return send(env, post.chat.id, `🗑 ${gone.length > 1 ? 'Счета удалены:\n' : 'Счёт удалён: '}${what}`, { ...replyTo(post.message_id), reply_markup: statsButtons(gone[0].month) });
     }
@@ -197,6 +209,7 @@ async function onCallback(env, cb) {
   const saved = await getKv(db, 'token');
   const client = itchargeClient(env, saved);
   let text;
+  const docs = await (async () => (await db.prepare('SELECT doc_msg, invoices FROM docs').all()).results)().catch(() => []);
   try {
     const invoices = await loadInvoices(db);
     // пока окончательного нет, свет оцениваем по средней цене кВт⋅ч машинам из прошлых счетов
@@ -206,7 +219,8 @@ async function onCallback(env, cb) {
     text = `⚠️ Не получилось собрать статистику: ${err.message}`;
   }
   if (client.token() && client.token() !== saved) await setKv(db, 'token', client.token());
-  const back = { inline_keyboard: [[{ text: '◀️ Все месяцы', callback_data: 'menu' }]] };
+  // документы месяца — кнопками-ссылками на PDF в канале
+  const back = { inline_keyboard: [...docButtons(docs, m[1], (id) => msgLink(env, id)), [{ text: '◀️ Все месяцы', callback_data: 'menu' }]] };
   if (/^(📅|📊)/.test(msg.text ?? '')) return tg(env, 'editMessageText', { chat_id: msg.chat.id, message_id: msg.message_id, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: back });
   return send(env, msg.chat.id, text, { reply_markup: back });
 }

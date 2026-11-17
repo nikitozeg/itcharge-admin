@@ -265,6 +265,24 @@ export function formatInvoiceAck(results, statuses, { actMonths = [] } = {}) {
   return lines.join('\n');
 }
 
+// Кнопки-ссылки на PDF в канале для карточки месяца — документы, где есть счёт за этот месяц.
+// docs: [{ doc_msg, invoices: [{ month, kind }] }]; link(msgId) — ссылка на сообщение канала.
+export function docButtons(docs, key, link) {
+  const rank = { final: 0, penalty: 1, adv40: 2, adv30: 3 };
+  const cap = (s) => s[0].toUpperCase() + s.slice(1);
+  return docs.map((d) => {
+    const list = typeof d.invoices === 'string' ? JSON.parse(d.invoices) : d.invoices;
+    const here = list.filter((i) => i.month === key);
+    if (!here.length) return null;
+    const fin = list.find((i) => i.kind === 'final');
+    // пакет ТНС называем по месяцу окончательного; что в нём за этот месяц — если это не сам окончательный
+    const text = list.length > 1
+      ? `Пакет за ${monthTitle(startOfKey((fin ?? list[0]).month))}${fin?.month === key ? '' : ` — ${here.map((i) => KINDS[i.kind]).join(', ')}`}`
+      : `${cap(KINDS[list[0].kind])} за ${monthTitle(startOfKey(list[0].month))}`;
+    return { order: Math.min(...here.map((i) => rank[i.kind] ?? 9)), msg: d.doc_msg, text: `📄 ${text}` };
+  }).filter(Boolean).sort((a, b) => a.order - b.order || b.msg - a.msg).slice(0, 8).map((b) => [{ text: b.text, url: link(b.msg) }]);
+}
+
 export const UNRECOGNIZED = '❓ <b>Не смог распознать счёт.</b> Ответь на это сообщение текстом, например:\n<code>30% октябрь 2026 13109,46</code>\n<code>окончательный сентябрь 2026 4321,10</code>\n<code>пени сентябрь 2026 66,43</code>';
 
 // Кнопки по месяцам: последние 12, по три в ряд; ✅ — все счета есть, ⚠️ — каких-то не хватает.
