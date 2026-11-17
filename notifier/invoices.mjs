@@ -98,7 +98,8 @@ const rowNums = (row) => row.split(/\s{2,}/).slice(1).filter((c) => /^-?[\d\s]+(
 
 function parseOne(lines) {
   const text = lines.join('\n');
-  const numM = text.match(/№\s*(\d{6,}\/\d+)\s+от\s+(\d{2})\.(\d{2})\.(\d{4})/);
+  // номер: «№ 12100001187/201769 от 30.09.2026» в пакете, «№ 1000/70625/01 от 31.10.2026г.» в отдельном счёте
+  const numM = text.match(/№\s*(\d+(?:\/\d+)+)\s+от\s+(\d{2})\.(\d{2})\.(\d{4})/);
   if (!numM) return [];
   const issued = `${numM[4]}-${numM[3]}-${numM[2]}`;
   const inv = { number: numM[1], issued, amount: null, kwh: null, tariff: null };
@@ -120,14 +121,15 @@ function parseOne(lines) {
     inv.tariff = rows[0][1];
   }
   if (kind !== 'final') return payM ? [{ ...inv, amount: ruNum(payM[1]), kind, month }] : [];
-  // окончательный: «Итого к оплате по счёту» — остаток после авансов (последняя колонка строки «Электроэнергия»),
-  // объём — по счётчику за весь месяц; пени, начисленные в этом месяце, — в той же таблице
+  // окончательный в пакете: «Итого к оплате по счёту» — остаток после авансов (последняя колонка строки «Электроэнергия»),
+  // объём — по счётчику за весь месяц; пени, начисленные в этом месяце, — в той же таблице.
+  // Отдельный счёт («Окончательный расчет за октябрь») — без этой таблицы: в нём вся сумма за месяц, авансы не вычтены.
   const debt = lines.find((l) => /^\d+\s+Электроэнергия(\s|$)/.test(l.trim()));
   const totalM = text.match(/Всего с НДС:?\s*(-?[\d\s]+,\d{2})/i);
   const amount = debt ? rowNums(debt).at(-1) : totalM ? ruNum(totalM[1]) : undefined;
   if (amount == null) return [];
   // к оплате бывает 0, если авансы переплатили; начислено за месяц — колонка «Начислено» той же строки
-  const out = [{ ...inv, amount, kind, month, accrued: debt ? rowNums(debt)[1] ?? null : null }];
+  const out = [{ ...inv, amount, kind, month, accrued: debt ? rowNums(debt)[1] ?? null : totalM ? ruNum(totalM[1]) : null }];
   const peni = lines.find((l) => /^\d+\s+ПЕНИ(\s|$)/i.test(l.trim()));
   const accrued = peni ? rowNums(peni)[1] : 0; // колонки: долг на начало, начислено, перерасчёт, оплачено, …
   if (accrued > 0) out.push({ id: `${numM[1]}-пени`, number: numM[1], issued, amount: accrued, kwh: null, tariff: null, kind: 'penalty', month });
@@ -224,6 +226,7 @@ export function monthTariff(invoices, key) {
 const STATE_ICON = { ok: '✅', missing: '❌', waiting: '⏳', none: '⚪' };
 const invoiceSummary = (inv) => {
   const charge = monthCharge(inv);
+  if (charge != null && Math.abs(inv.amount - charge) < 0.005 && inv.amount > 0) return `${nf2.format(inv.amount)} ₽ — вся сумма за месяц${inv.kwh ? `, ${nf2.format(inv.kwh)} кВт⋅ч` : ''}; оплаченные авансы в счёте не вычтены`;
   if (charge != null) return `к оплате ${nf2.format(inv.amount)} ₽ · за месяц начислено ${nf2.format(charge)} ₽${inv.kwh ? ` за ${nf2.format(inv.kwh)} кВт⋅ч по счётчикам обеих станций` : ' (по акту сверки)'}`;
   return `${nf2.format(inv.amount)} ₽${inv.kwh != null ? ` · ${nf2.format(inv.kwh)} кВт⋅ч` : ''}`;
 };
