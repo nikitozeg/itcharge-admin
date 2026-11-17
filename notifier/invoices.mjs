@@ -368,10 +368,14 @@ export function formatMonthStats({ cur, prev, mStart, mEnd }, invoices, now = Da
   // счёт общий на обе станции; ведомость делит его по счётчикам — станцию узнаём по мощности (DC150 → 150, АС22 → 22)
   const perStation = [];
   const meters = meterList(fin);
+  // мощность точки в ведомости бывает разной (в октябре 2026 у DC150 — 85 вместо 150): сверяем со всеми, что знаем по этой точке
+  const pointPowers = new Map();
+  for (const i of invoices) for (const m of meterList(i) ?? []) if (m.power != null) pointPowers.set(m.point, new Set([...(pointPowers.get(m.point) ?? []), m.power]));
   if (meters?.length) {
     lines.push('🔌 Счёт общий на обе станции, по счётчикам:');
     for (const m of meters) {
-      const name = [...byStation.keys()].find((n) => m.power != null && shortStation(n ?? '').replace(/\D/g, '') === String(m.power));
+      const powers = pointPowers.get(m.point) ?? new Set(m.power != null ? [m.power] : []);
+      const name = [...byStation.keys()].find((n) => powers.has(Number(shortStation(n ?? '').replace(/\D/g, ''))));
       const a = byStation.get(name) ?? { rub: 0, kwh: 0 };
       const label = name ? esc(shortStation(name)) : m.power != null ? `станция ${nf0.format(m.power)} кВт` : `точка ${m.point}`;
       const d = m.kwh > 0 ? ((m.kwh - a.kwh) / m.kwh) * 100 : null; // меньше нуля — показания сдвинулись между месяцами
