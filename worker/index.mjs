@@ -5,7 +5,7 @@
 import { check } from '../notifier/core.mjs';
 import { electricityPerKwh } from '../notifier/invoices.mjs';
 import { getKv, setKv } from './db.mjs';
-import { handleUpdate, retryInbox, postMenu, setWebhook, parseInvoicePdf, loadInvoices } from './telegram.mjs';
+import { handleUpdate, retryInbox, postMenu, setWebhook, parseInvoicePdf, loadInvoices, archiveDoc } from './telegram.mjs';
 
 const LOCK_TTL = 120e3; // проверку дольше двух минут считаем зависшей
 
@@ -66,7 +66,7 @@ export default {
     }
 
     // Ручной запуск: POST /run (?test=1 — тестовые сообщения, ?monthly=1 — пример месячного итога,
-    // ?setup=webhook, ?menu=1, ?parse=1), только с ключом.
+    // ?setup=webhook, ?menu=1, ?parse=1, ?doc=1), только с ключом.
     if (url.pathname === '/run' && request.method === 'POST') {
       if (!env.ADMIN_KEY || request.headers.get('authorization') !== `Bearer ${env.ADMIN_KEY}`) {
         return new Response('forbidden', { status: 403 });
@@ -76,6 +76,14 @@ export default {
       if (url.searchParams.get('menu') === '1') return Response.json(await postMenu(env));
       // ?parse=1 с PDF в теле — проверить распознавание счёта, ничего не сохраняя
       if (url.searchParams.get('parse') === '1') return Response.json(await parseInvoicePdf(new Uint8Array(await request.arrayBuffer())));
+      // ?doc=1&name=…&caption=…&invoices=[{month,kind}] с PDF в теле — выложить документ в канал для кнопок месяцев
+      // (разбор — на компьютере: в лимит процессора воркера большой пакет может не уложиться)
+      if (url.searchParams.get('doc') === '1') {
+        const invoices = JSON.parse(url.searchParams.get('invoices') ?? '[]');
+        if (!invoices.length || !invoices.every((i) => /^\d{4}-\d{2}$/.test(i.month) && ['adv30', 'adv40', 'final', 'penalty'].includes(i.kind))) return new Response('bad invoices', { status: 400 });
+        const doc = { name: url.searchParams.get('name') || 'счёт.pdf', caption: url.searchParams.get('caption') || '📄', invoices: invoices.map(({ month, kind }) => ({ month, kind })) };
+        return Response.json(await archiveDoc(env, new Uint8Array(await request.arrayBuffer()), doc));
+      }
       const result = await runOnce(env, { test: url.searchParams.get('test') === '1', monthlyTest: url.searchParams.get('monthly') === '1' });
       return Response.json({ log: result.log, error: result.error ?? null });
     }

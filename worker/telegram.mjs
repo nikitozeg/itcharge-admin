@@ -236,6 +236,21 @@ export async function parseInvoicePdf(bytes) {
   return { invoices: parseInvoices(lines), act: parseAct(lines), lines: lines.length };
 }
 
+// Выложить в канал PDF, которого там ещё нет (счета уже в базе — их разобрали на компьютере), тихо,
+// и запомнить для кнопок в карточках месяцев. invoices — [{ month, kind }] из разбора.
+export async function archiveDoc(env, bytes, { name, invoices, caption }) {
+  const form = new FormData();
+  form.append('chat_id', normalizeChatId(env.TELEGRAM_CHAT_ID));
+  form.append('caption', caption);
+  form.append('disable_notification', 'true');
+  form.append('document', new Blob([bytes], { type: 'application/pdf' }), name);
+  const r = await fetch(`https://api.telegram.org/bot${bot(env)}/sendDocument`, { method: 'POST', body: form }).then((x) => x.json());
+  if (!r.ok) return { ok: false, error: r.description };
+  await env.DB.prepare('INSERT OR REPLACE INTO docs (doc_msg, file_name, invoices, added) VALUES (?1, ?2, ?3, ?4)')
+    .bind(r.result.message_id, name, JSON.stringify(invoices), new Date().toISOString()).run();
+  return { ok: true, msg: r.result.message_id };
+}
+
 export async function postMenu(env) {
   return send(env, normalizeChatId(env.TELEGRAM_CHAT_ID), menuText(), { reply_markup: monthsKeyboard(await loadInvoices(env.DB)) });
 }

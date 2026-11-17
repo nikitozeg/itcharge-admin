@@ -265,20 +265,24 @@ export function formatInvoiceAck(results, statuses, { actMonths = [] } = {}) {
   return lines.join('\n');
 }
 
+// Название PDF по счетам в нём: пакет ТНС — по месяцу окончательного, отдельный счёт — по виду и месяцу.
+export function docTitle(list) {
+  if (list.length > 1) return `Пакет за ${monthTitle(startOfKey((list.find((i) => i.kind === 'final') ?? list[0]).month))}`;
+  const k = KINDS[list[0].kind];
+  return `${k[0].toUpperCase() + k.slice(1)} за ${monthTitle(startOfKey(list[0].month))}`;
+}
+
 // Кнопки-ссылки на PDF в канале для карточки месяца — документы, где есть счёт за этот месяц.
 // docs: [{ doc_msg, invoices: [{ month, kind }] }]; link(msgId) — ссылка на сообщение канала.
 export function docButtons(docs, key, link) {
   const rank = { final: 0, penalty: 1, adv40: 2, adv30: 3 };
-  const cap = (s) => s[0].toUpperCase() + s.slice(1);
   return docs.map((d) => {
     const list = typeof d.invoices === 'string' ? JSON.parse(d.invoices) : d.invoices;
     const here = list.filter((i) => i.month === key);
     if (!here.length) return null;
+    // у пакета дописываем, что в нём за этот месяц, — если это не сам окончательный
     const fin = list.find((i) => i.kind === 'final');
-    // пакет ТНС называем по месяцу окончательного; что в нём за этот месяц — если это не сам окончательный
-    const text = list.length > 1
-      ? `Пакет за ${monthTitle(startOfKey((fin ?? list[0]).month))}${fin?.month === key ? '' : ` — ${here.map((i) => KINDS[i.kind]).join(', ')}`}`
-      : `${cap(KINDS[list[0].kind])} за ${monthTitle(startOfKey(list[0].month))}`;
+    const text = `${docTitle(list)}${list.length > 1 && fin?.month !== key ? ` — ${here.map((i) => KINDS[i.kind]).join(', ')}` : ''}`;
     return { order: Math.min(...here.map((i) => rank[i.kind] ?? 9)), msg: d.doc_msg, text: `📄 ${text}` };
   }).filter(Boolean).sort((a, b) => a.order - b.order || b.msg - a.msg).slice(0, 8).map((b) => [{ text: b.text, url: link(b.msg) }]);
 }
